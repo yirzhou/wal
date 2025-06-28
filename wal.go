@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -12,7 +13,9 @@ const (
 	checksumSize = 4
 )
 
-type Log struct {
+var ErrBadChecksum = errors.New("wal: checksum mismatch")
+
+type WAL struct {
 	// We need a mutex to protect access from multiple goroutines
 	// in the future. It's good practice to include it from the start.
 	mu sync.Mutex
@@ -27,6 +30,7 @@ type Log struct {
 	// We'll add more fields later, like the current sequence number.
 }
 
+// prepareRecordData prepares the record data for the log.
 func prepareRecordData(sequenceNum uint64, key, value []byte) []byte {
 	keySize := uint32(len(key))
 	valueSize := uint32(len(value))
@@ -41,6 +45,7 @@ func prepareRecordData(sequenceNum uint64, key, value []byte) []byte {
 	return bytes
 }
 
+// createLogRecord creates a log record for the given sequence number, key, and value.
 func createLogRecord(sequenceNum uint64, key, value []byte) LogRecord {
 	recordData := prepareRecordData(sequenceNum, key, value)
 
@@ -55,7 +60,8 @@ func createLogRecord(sequenceNum uint64, key, value []byte) LogRecord {
 	}
 }
 
-func (l *Log) Append(key, value []byte) error {
+// Append appends a new record to the log.
+func (l *WAL) Append(key, value []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -77,56 +83,49 @@ func (l *Log) Append(key, value []byte) error {
 	return l.file.Sync() // fsync()
 }
 
-func (l *Log) recover() error {
-	for {
-		buf := make([]byte, headerSize)
-		n, err := l.file.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-		if n < headerSize {
-			// The header itself is not even valid. Stop here.
-			break
-		}
+func recoverNextRecord(reader io.Reader) (*LogRecord, error) {
+	buf := make([]byte, headerSize)
 
-		// Read the header fields.
-		checksum := binary.LittleEndian.Uint32(buf[:checksumSize])
-		sequenceNum := binary.LittleEndian.Uint64(buf[checksumSize:headerSize])
-		keySize := binary.LittleEndian.Uint32(buf[checksumSize+8 : headerSize])
-		valueSize := binary.LittleEndian.Uint32(buf[checksumSize+12 : headerSize])
-
-		// Assuming a 64-bit system, the sum of keySize and valueSize is always positive.
-		keyValueSize := int(keySize) + int(valueSize)
-		keyValue := make([]byte, keyValueSize)
-		_, err = l.file.Read(keyValue)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-		// Append the header and the key and value to the buffer.
-		entireBytes := append(buf[checksumSize:], keyValue...)
-		// Compute the checksum of the entire record.
-		computedChecksum := ComputeChecksum(entireBytes)
-		if computedChecksum != checksum {
-			// Invalid checksum. Stop here
-			break
-		}
-
-		// Update the last sequence number if this record has a higher sequence number.
-		if sequenceNum > l.lastSequenceNum {
-			l.lastSequenceNum = sequenceNum
-		}
+	_, err := io.ReadFull(reader, buf)
+	if err != nil {
+		// EOF is handled
+		return nil, err
 	}
-	return nil
+
+	// Read the header fields.
+	checksum := binary.LittleEndian.Uint32(buf[:checksumSize])
+	sequenceNum := binary.LittleEndian.Uint64(buf[checksumSize:headerSize])
+	keySize := binary.LittleEndian.Uint32(buf[checksumSize+8 : headerSize])
+	valueSize := binary.LittleEndian.Uint32(buf[checksumSize+12 : headerSize])
+
+	// Assuming a 64-bit system, the sum of keySize and valueSize is always positive.
+	keyValueSize := int(keySize) + int(valueSize)
+	payloadBuf := make([]byte, keyValueSize)
+	_, err = io.ReadFull(reader, payloadBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	// Compute checksum of entire record.
+	dataToVerify := append(buf[checksumSize:], payloadBuf...)
+	computedChecksum := ComputeChecksum(dataToVerify)
+	if computedChecksum != checksum {
+		// Bad checksum.
+		return nil, ErrBadChecksum
+	}
+
+	return &LogRecord{
+		CheckSum:    checksum,
+		SequenceNum: sequenceNum,
+		KeySize:     keySize,
+		ValueSize:   valueSize,
+		Key:         payloadBuf[:keySize],
+		Value:       payloadBuf[keySize:],
+	}, nil
 }
 
 // Close shuts down the log file.
-func (l *Log) Close() error {
+func (l *WAL) Close() error {
 	// Implementation will:
 	// 1. Lock the mutex.
 	// 2. Defer unlocking.

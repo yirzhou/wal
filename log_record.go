@@ -21,6 +21,11 @@ type LogRecord struct {
 	Value       []byte
 }
 
+// Size returns the size of the log record.
+func (lr *LogRecord) Size() int {
+	return 20 + int(lr.KeySize) + int(lr.ValueSize)
+}
+
 // Deserialize converts a byte array to a LogRecord according to the specified format.
 func Deserialize(data []byte) (LogRecord, error) {
 	lr := LogRecord{}
