@@ -1,0 +1,601 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	checkpointDir     = "checkpoints"
+	logsDir           = "logs"
+	checkpointFile    = "CHECKPOINT"
+	walFilePrefix     = "wal-"
+	segmentFilePrefix = "segment-"
+)
+
+// Write to WAL -> Update Memtable -> (When ready) -> Flush Memtable to SSTable -> Checkpoint -> Delete old WAL
+// In this process, the flush is done by the memtable.
+
+// Pair is a key-value pair.
+type Pair struct {
+	Key   string
+	Value []byte
+}
+
+type KVStore struct {
+	lock     sync.RWMutex
+	wal      *WAL
+	memState *MemState
+	dir      string
+}
+
+// compareWalFilesAscending compares two WAL file names in ascending order.
+func compareWalFilesAscending(a, b string) int {
+	segmentIDA, err := getSegmentIDFromWalFileName(a)
+	if err != nil {
+		return 1
+	}
+	segmentIDB, err := getSegmentIDFromWalFileName(b)
+	if err != nil {
+		return -1
+	}
+	return int(segmentIDA - segmentIDB)
+}
+
+// getWalDir returns the directory where the WAL files are stored.
+func (kv *KVStore) getWalDir() string {
+	return filepath.Join(kv.dir, logsDir)
+}
+
+// Get returns the value for a given key.
+func (kv *KVStore) Get(key []byte) ([]byte, error) {
+	kv.lock.RLock()
+	defer kv.lock.RUnlock()
+	return kv.memState.Get(key)
+}
+
+// Put writes a key-value pair to the KVStore.
+func (kv *KVStore) Put(key, value []byte) error {
+	kv.lock.Lock()
+	defer kv.lock.Unlock()
+
+	// 1. Write to WAL
+	walErr := kv.wal.Append(key, value)
+
+	// 2. Check if the memtable is ready to be flushed (checkpoint)
+	if walErr != nil && walErr != ErrCheckpointNeeded {
+		log.Println("Error writing to WAL:", walErr)
+		return walErr
+	}
+
+	// 3. Update Memtable
+	memStateErr := kv.memState.Put(key, value)
+	if memStateErr != nil {
+		log.Println("Error updating Memtable:", memStateErr)
+		return memStateErr
+	}
+
+	// 4. Check if the WAL is ready to be checkpointed
+	if walErr == ErrCheckpointNeeded {
+		log.Println("WAL is ready to be checkpointed")
+		// checkpoint the memtable
+		err := kv.doCheckpoint()
+		if err != nil {
+			log.Println("Error checkpointing:", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// getSegmentIDFromWalFileName returns the segment ID from a WAL file name.
+func getSegmentIDFromWalFileName(fileName string) (uint64, error) {
+	segmentId := strings.TrimPrefix(fileName, walFilePrefix)
+	segmentIdInt, err := strconv.ParseUint(segmentId, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return segmentIdInt, nil
+}
+
+// getSegmentIDFromSegmentFileName returns the segment ID from a segment file name.
+func getSegmentIDFromSegmentFileName(fileName string) (uint64, error) {
+	segmentId := strings.TrimPrefix(fileName, segmentFilePrefix)
+	segmentIdInt, err := strconv.ParseUint(segmentId, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return segmentIdInt, nil
+}
+
+// getSegmentFileNameFromSegmentId constructs the filename for a segment file from a segment ID.
+func getSegmentFileNameFromSegmentId(segmentId uint64) string {
+	return fmt.Sprintf("%s%06d", segmentFilePrefix, segmentId)
+}
+
+// tryGetLastCheckpoint tries to get the last checkpoint file path from the checkpoint file and the WAL files.
+func tryGetLastCheckpoint(checkpointDir, walDir string) string {
+	checkpointFilePath, _ := tryGetLastCheckpointFromFile(checkpointDir)
+	if checkpointFilePath != "" {
+		return checkpointFilePath
+	}
+	checkpointFilePath, _ = tryGetLastCheckpointFromWalFiles(walDir)
+	if checkpointFilePath != "" {
+		return checkpointFilePath
+	}
+	return ""
+}
+
+// tryGetLastCheckpoint tries to get the last checkpoint file path.
+// If the file does not exist, it returns an empty string and no error.
+func tryGetLastCheckpointFromFile(checkpointDir string) (string, error) {
+	checkpointFilePath := filepath.Join(checkpointDir, checkpointFile)
+	// Creates the file if it doesn't exist.
+	checkpointFile, err := os.OpenFile(checkpointFilePath, os.O_RDONLY, 0644)
+	if err != nil {
+		log.Println("Error opening checkpoint file:", err)
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer checkpointFile.Close()
+
+	// Read the file.
+	bytes, err := io.ReadAll(checkpointFile)
+	if err != nil {
+		log.Println("Error reading checkpoint file:", err)
+		return "", err
+	}
+	// Verify the checksum of the file.
+	checksum := binary.LittleEndian.Uint32(bytes[:4])
+	if checksum != ComputeChecksum(bytes[4:]) {
+		log.Println("Checksum mismatch in checkpoint file")
+		return "", ErrBadChecksum
+	}
+	// Return the segment file path.
+	return string(bytes[4:]), nil
+}
+
+// getLastCheckpointFilePathFromWalFile tries to get the last checkpoint file path from a WAL file.
+// If the WAL file does not contain a CHECKPOINT record, it returns an empty string and no error.
+func getLastCheckpointFilePathFromWalFile(walFilePath string) (string, error) {
+	walFile, err := os.Open(walFilePath)
+	if err != nil {
+		return "", err
+	}
+	defer walFile.Close()
+	// Read the file from the beginning.
+	_, err = walFile.Seek(0, io.SeekStart)
+	if err != nil {
+		log.Println("Error seeking to start:", err)
+		return "", err
+	}
+	lastCheckpointFilePath := ""
+	for {
+		_, err := walFile.Seek(0, io.SeekCurrent)
+		if err != nil {
+			log.Println("Error seeking to current position:", err)
+			break
+		}
+		// Read the first record.
+		record, err := recoverNextRecord(walFile)
+		if err != nil && err != io.EOF {
+			log.Println("Error recovering next record:", err)
+			break
+		}
+
+		if record == nil {
+			// EOF
+			break
+		}
+		// Return the segment file path. If the record is not a CHECKPOINT record, return an empty string.
+		if string(record.Key) == "$CHECKPOINT" {
+			log.Println("Found CHECKPOINT record in WAL file:", walFilePath)
+			lastCheckpointFilePath = string(record.Value)
+			// Keep updating the last checkpoint file.
+		}
+	}
+	return lastCheckpointFilePath, nil
+}
+
+// tryGetLastCheckpointFromWalFiles tries to get the last checkpoint file path from the WAL files.
+func tryGetLastCheckpointFromWalFiles(walDir string) (string, error) {
+	walFiles, err := listWALFiles(walDir)
+	if err != nil {
+		return "", err
+	}
+	// Sort all files by segment ID in reverse order.
+	slices.SortFunc(walFiles, compareWalFilesAscending)
+	slices.Reverse(walFiles)
+	// Get the last checkpoint file path from the WAL files (reverse order).
+	for _, walFile := range walFiles {
+		checkpointFilePath := filepath.Join(walDir, walFile)
+		checkpointFilePath, err := getLastCheckpointFilePathFromWalFile(checkpointFilePath)
+		if err != nil {
+			log.Println("Error getting last checkpoint file path from WAL file:", err)
+			// Skip this file.
+		} else if checkpointFilePath != "" {
+			return checkpointFilePath, nil
+		}
+	}
+	return "", nil
+}
+
+// updateCheckpointFile atomically updates the checkpoint file with the new segment file path.
+func (kv *KVStore) updateCheckpointFile(segmentFilePath string) error {
+	// Get the current unix timestamp as a string.
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	tempCheckpointFilePath := filepath.Join(kv.dir, checkpointDir, fmt.Sprintf("%s.%s", checkpointFile, timestamp))
+	tempCheckpointFile, err := os.OpenFile(tempCheckpointFilePath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		log.Println("Error opening temp checkpoint file:", err)
+		return err
+	}
+	defer tempCheckpointFile.Close()
+
+	// Compute the checksum of the segment file path.
+	checksum := ComputeChecksum([]byte(segmentFilePath))
+	bytes := make([]byte, 4+len(segmentFilePath))
+	binary.LittleEndian.PutUint32(bytes[:4], checksum)
+	copy(bytes[4:], segmentFilePath)
+
+	// Write the segment file path to the temp checkpoint file.
+	_, err = tempCheckpointFile.Write(bytes)
+	if err != nil {
+		log.Println("Error writing to temp checkpoint file:", err)
+		return err
+	}
+	tempCheckpointFile.Sync()
+
+	// Rename the temp checkpoint file to the actual checkpoint file.
+	err = os.Rename(tempCheckpointFilePath, filepath.Join(kv.dir, checkpointDir, checkpointFile))
+	if err != nil {
+		log.Println("Error renaming temp checkpoint file:", err)
+		return err
+	}
+	return nil
+}
+
+// cleanUpWALFiles removes all WAL files with segment ID less than or equal to the last segment ID.
+func (kv *KVStore) cleanUpWALFiles(lastSegmentID uint64) error {
+	walFiles, err := listWALFiles(kv.getWalDir())
+	if err != nil {
+		log.Println("Error listing WAL files during cleanup:", err)
+		return err
+	} else {
+		// Remove all WAL files.
+		for _, walFile := range walFiles {
+			segmentID, err := getSegmentIDFromWalFileName(walFile)
+			if err != nil {
+				log.Printf("Error getting segment ID from WAL file %s: %v\n", walFile, err)
+				// Skip this file. The file name is potentially corrupted.
+				continue
+			}
+			if segmentID <= lastSegmentID {
+				err = os.Remove(filepath.Join(kv.getWalDir(), walFile))
+				if err != nil {
+					log.Printf("Error removing WAL file %s: %v\n", walFile, err)
+					// Skip this file for now which will be picked up by future checkpoints or cleanup jobs.
+				} else {
+					log.Printf("Removed WAL file %s\n", walFile)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// getNewSegmentFilePath returns the path to the next segment file.
+func (kv *KVStore) getNewSegmentFilePath() string {
+	lastSegmentID := kv.wal.GetLastSegmentID()
+	segmentFileName := getSegmentFileNameFromSegmentId(lastSegmentID + 1)
+	return filepath.Join(kv.dir, checkpointDir, segmentFileName)
+}
+
+// doCheckpoint is the main function that performs a checkpoint.
+// It creates a new segment file, converts the memtable to an SSTable,
+// and writes the SSTable to the segment file.
+// It also appends a special CHECKPOINT record to the WAL and updates the checkpoint file.
+// Finally, it removes all old WAL files.
+// TODO: checkpointing on normal shutdown.
+func (kv *KVStore) doCheckpoint() error {
+	// Create the checkpoint directory if it doesn't exist.
+	checkpointDir := filepath.Join(kv.dir, checkpointDir)
+	err := os.MkdirAll(checkpointDir, 0755)
+	if err != nil {
+		log.Println("Error creating checkpoint directory:", err)
+		return err
+	}
+
+	// 1. Persist the memtable to a new segment file.
+	segmentFilePath := kv.getNewSegmentFilePath()
+	err = kv.memState.Flush(segmentFilePath)
+	if err != nil {
+		log.Println("Error flushing memtable to segment file:", err)
+		return err
+	}
+
+	// 2. Append a special CHECKPOINT record to the WAL.
+	kv.wal.Append([]byte("$CHECKPOINT"), []byte(segmentFilePath))
+
+	// 3. Atomically update a CHECKPOINT file which records the last segment file path.
+	err = kv.updateCheckpointFile(segmentFilePath)
+	if err != nil {
+		log.Println("Error updating checkpoint file:", err)
+		return err
+	}
+
+	// 4. Remove all old WAL files. This process can be done in the background without holding back the main thread.
+	lastSegmentID := kv.wal.GetLastSegmentID()
+	err = kv.cleanUpWALFiles(lastSegmentID)
+	if err != nil {
+		log.Println("Error cleaning up WAL files:", err)
+		return err
+	}
+
+	// 5. Remove all old checkpoints.
+	// TODO
+	return nil
+}
+
+// listWALFiles lists all the WAL files in the directory.
+func listWALFiles(dir string) ([]string, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	walFiles := make([]string, 0)
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), walFilePrefix) {
+			walFiles = append(walFiles, file.Name())
+		}
+	}
+	return walFiles, nil
+}
+
+// listSegmentFiles lists all the segment files in the directory.
+func listSegmentFiles(dir string) ([]string, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	segmentFiles := make([]string, 0)
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), segmentFilePrefix) {
+			segmentFiles = append(segmentFiles, file.Name())
+		}
+	}
+	return segmentFiles, nil
+}
+
+// getHighestSegmentID returns the highest segment ID from the list of WAL files. If any file is not named correctly, it will be skipped.
+// Note that zero will be returned if no files are found.
+func getHighestSegmentID(files []string) uint64 {
+	highestId := uint64(0)
+	for _, file := range files {
+		segmentId := strings.TrimPrefix(file, "wal-")
+		segmentIdInt, err := strconv.ParseUint(segmentId, 10, 64)
+		if err != nil {
+			log.Println("Error parsing segment ID:", err)
+			// Skip this file.
+		} else {
+			highestId = max(highestId, segmentIdInt)
+		}
+	}
+	return highestId
+}
+
+// getWalFileNameFromSegmentID constructs the filename for a WAL file from a segment ID.
+func getWalFileNameFromSegmentID(segmentId uint64) string {
+	return fmt.Sprintf("%s%06d", walFilePrefix, segmentId)
+}
+
+// recoverFromWALs recovers the WAL files and returns the WAL object.
+func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState) (*WAL, error) {
+	// Create the WAL directory if it doesn't exist.
+	err := os.MkdirAll(walDir, 0755)
+	if err != nil {
+		log.Println("Error creating WAL directory:", err)
+		return nil, err
+	}
+	wal := &WAL{
+		dir: walDir,
+	}
+	walFiles, err := listWALFiles(walDir)
+	if err != nil {
+		return nil, err
+	}
+	// Sort all files by segment ID in ascending order.
+	slices.SortFunc(walFiles, compareWalFilesAscending)
+	// Get the last checkpoint file path from the WAL files (ascending order).
+	for idx, walFile := range walFiles {
+		segmentID, err := getSegmentIDFromWalFileName(walFile)
+		if err != nil {
+			log.Println("Error getting segment ID from WAL file:", err)
+			// Skip this file if the name does not match the expected format.
+			continue
+		}
+		// Process the WAL file only if the segment ID is greater than the last segment ID.
+		if segmentID > lastSegmentID {
+			log.Println("Recovering from WAL file:", walFile)
+			isLastWal := idx == len(walFiles)-1
+			// Open the WAL file.
+			walFile, err := os.OpenFile(filepath.Join(walDir, walFile), flags, 0644)
+			if err != nil {
+				log.Printf("Error opening WAL file: %s: %v\n", walFile.Name(), err)
+				log.Fatalf("Error opening WAL file: %s: %v\n", walFile.Name(), err)
+			}
+
+			if !isLastWal {
+				// The last WAL file will be kept open for future appends.
+				defer walFile.Close()
+			}
+
+			lastSequenceNum, err := recoverFromWALFile(walFile, memState, isLastWal)
+			if err != nil {
+				log.Fatalf("Error processing WAL file: %s: %v", walFile.Name(), err)
+			}
+			if isLastWal {
+				// Construct the WAL
+				wal = &WAL{
+					activeFile:      walFile,
+					activeSegmentID: segmentID,
+					dir:             walDir,
+					segmentSize:     CheckpointSize,
+					lastSequenceNum: lastSequenceNum,
+				}
+			}
+		}
+	}
+	return wal, nil
+}
+
+// recoverFromWALFile processes a WAL file and returns the last sequence number.
+// It also updates the in-memory state.
+// If the WAL file is the last one, it truncates the file to the last good offset.
+func recoverFromWALFile(reader *os.File, memState *MemState, isLastWal bool) (uint64, error) {
+	var goodOffset int64 = 0
+	var lastSequenceNum uint64 = 0
+	_, err := reader.Seek(0, io.SeekStart)
+	if err != nil {
+		log.Printf("Error seeking to start of WAL file: %s: %v\n", reader.Name(), err)
+		return 0, err
+	}
+	// Scan the file to populate lastSequenceNum.
+	for {
+		offset, err := reader.Seek(0, io.SeekCurrent)
+		if err != nil {
+			log.Println("Error seeking:", err)
+			return 0, err
+		}
+
+		record, err := recoverNextRecord(reader)
+		// Check the current offset of the reader.
+		if err != nil {
+			// If we get an End-Of-File error, it's a clean stop.
+			// This is the expected way to finish recovery.
+			if err == io.EOF {
+				log.Println("Completed recovery of WAL file:", reader.Name())
+				goodOffset = offset
+				break
+			}
+			// If we get a bad checksum, it means the last write was torn.
+			// We stop here and trust the log up to this point.
+			if err == ErrBadChecksum || err == io.ErrUnexpectedEOF {
+				if !isLastWal {
+					// Having corruption in an intermediate WAL file is a fatal error!
+					log.Fatalf("Bad checksum or unexpected EOF in WAL file: %s", reader.Name())
+				}
+				log.Println("Bad checksum or unexpected EOF", err.Error())
+				goodOffset = offset
+				break
+			}
+			// Any other error is unexpected.
+			log.Printf("Error recovering next record in WAL file: %s: %v", reader.Name(), err)
+			return 0, err
+		}
+
+		lastSequenceNum = record.SequenceNum
+		// Update the in-memory state.
+		memState.Put(record.Key, record.Value)
+	}
+
+	if isLastWal {
+		// Truncate the file if it's the last WAL file.
+		// This is done to remove the old records that have been recovered.
+		log.Println("Truncating to", goodOffset, "for WAL file:", reader.Name())
+		err = reader.Truncate(goodOffset)
+		if err != nil {
+			log.Println("Error truncating file:", err)
+			return 0, err
+		}
+		// Move to the good offset for future appends if it's the last WAL file.
+		_, err = reader.Seek(goodOffset, io.SeekStart)
+		if err != nil {
+			log.Println("Error seeking to good offset::", err)
+			return 0, err
+		}
+	}
+	return lastSequenceNum, nil
+}
+
+// Close closes the WAL file.
+func (kv *KVStore) Close() error {
+	return kv.wal.Close()
+}
+
+// GetLastSequenceNum returns the last sequence number.
+func (kv *KVStore) GetLastSequenceNum() uint64 {
+	return kv.wal.lastSequenceNum
+}
+
+// Print prints the memtable.
+func (kv *KVStore) Print() {
+	log.Println("Last sequence number:", kv.GetLastSequenceNum())
+	kv.memState.Print()
+}
+
+// NewKVStore opens/creates the log file and initializes the KVStore object.
+// 1. Try to get the last checkpoint file path from the checkpoint file and the WAL files.
+//
+// 2. If the checkpoint is found, open it and read the last segment file path.
+//
+// - Load the segment file into memtable.
+//
+// - For all WAL files with segment ID greater than the last segment ID in the checkpoint file, replay them into memtable in ascending order.
+//
+// - Truncate the WAL file (likely the last one) to the last good offset.
+//
+// 3. If the checkpoint is not found, simply start from the beginning of the WAL files and replay them into memtable in ascending order.
+//
+// - Truncate the WAL file (likely the last one) to the last good offset.
+//
+// 4. Create and return the KVStore object.
+func NewKVStore(dir string) (*KVStore, error) {
+	// Read the checkpoint if exists.
+	lastCheckpointFilePath := tryGetLastCheckpoint(filepath.Join(dir, checkpointDir), filepath.Join(dir, logsDir))
+	lastSegmentID := uint64(0)
+
+	memState := NewMemState()
+
+	if lastCheckpointFilePath != "" {
+		log.Println("Last checkpoint found:", lastCheckpointFilePath)
+		checkpointFileName := filepath.Base(lastCheckpointFilePath)
+		segmentID, err := getSegmentIDFromSegmentFileName(checkpointFileName)
+		if err != nil {
+			log.Println("Error getting segment ID from last checkpoint file:", err)
+			return nil, ErrCheckpointCorrupted
+		}
+		lastSegmentID = segmentID
+		// Recover memstate from checkpoint file.
+		memState, err = recoverFromCheckpoint(lastCheckpointFilePath)
+		if err != nil {
+			log.Println("Error recovering from checkpoint:", err)
+			return nil, ErrCheckpointCorrupted
+		}
+	}
+
+	// Recover from WAL files.
+	wal, err := recoverFromWALs(lastSegmentID, filepath.Join(dir, logsDir), memState)
+	if err != nil {
+		log.Println("Error recovering from WAL files:", err)
+		return nil, err
+	}
+
+	// Return the fully initialized, ready-to-use KVStore object.
+	return &KVStore{
+		wal:      wal,
+		memState: memState,
+		dir:      dir,
+	}, nil
+}

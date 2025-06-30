@@ -4,30 +4,38 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
 const (
 	headerSize   = 20
 	checksumSize = 4
+	// CheckpointSize = 64 * 1024 // 64KiB
+	CheckpointSize = 8 // 8 bytes for testing
+	flags          = os.O_RDWR | os.O_CREATE | os.O_APPEND
 )
 
-var ErrBadChecksum = errors.New("wal: checksum mismatch")
-
 type WAL struct {
-	// We need a mutex to protect access from multiple goroutines
-	// in the future. It's good practice to include it from the start.
+	// Lock is needed because the WAL can be a standalone component used by other components so it must take care of its own concurrency.
 	mu sync.Mutex
 
-	// The file handle to our wal.log file.
-	file *os.File
+	// The directory where the WAL files are stored.
+	dir string
 
-	path string
+	// The file handle for the current, active segment we are writing to.
+	activeFile *os.File
 
+	// The ID of the active segment (e.g., 1 for wal-0001).
+	activeSegmentID uint64
+
+	// The max size for each segment file before we roll to a new one.
+	segmentSize int64
+
+	// The last sequence number we have written to the active segment.
 	lastSequenceNum uint64
-
-	// We'll add more fields later, like the current sequence number.
 }
 
 // prepareRecordData prepares the record data for the log.
@@ -75,20 +83,106 @@ func (l *WAL) Append(key, value []byte) error {
 	encodedRecord := record.Serialize()
 
 	// 4. Write and Sync.
-	_, err := l.file.Write(encodedRecord)
+	_, err := l.activeFile.Write(encodedRecord)
 	if err != nil {
 		return err
 	}
 
-	return l.file.Sync() // fsync()
+	err = l.activeFile.Sync() // fsync()
+	if err != nil {
+		log.Println("Error syncing file:", err)
+		return err
+	}
+
+	// 5. Check if the log has reached its size threshold.
+	fileInfo, err := l.activeFile.Stat()
+	if err != nil {
+		log.Println("Error getting file info:", err)
+		return err
+	}
+
+	// 6. Check if the segment size has been reached. If so, roll to a new segment
+	if fileInfo.Size() >= l.segmentSize {
+		// If the segment size has been reached, roll to a new segment
+		err = l.rollToNewSegment()
+		if err != nil {
+			log.Println("Error rolling to a new segment:", err)
+			return err
+		}
+
+		// Special error to signal that the log has reached its size threshold.
+		// This is used to trigger a checkpoint.
+		return ErrCheckpointNeeded
+	}
+	return nil
 }
 
+func (l *WAL) GetLastSegmentID() uint64 {
+	if l.activeSegmentID == 1 {
+		log.Panicln("No segments have been written yet -- this function should not have been called.")
+		return 0
+	}
+	return l.activeSegmentID - 1
+}
+
+// GetLastSegmentID returns the ID of the last segment.
+// It panics if no segments have been written yet.
+func (l *WAL) GetLastSegmentFile() (*os.File, error) {
+	lastSegmentID := l.GetLastSegmentID()
+	if lastSegmentID == 0 {
+		log.Panicln("No segments have been written yet -- this function should not have been called.")
+		return nil, errors.New("no segments have been written yet")
+	}
+
+	lastSegmentFileName := getWalFileNameFromSegmentID(lastSegmentID)
+	lastSegmentFilePath := filepath.Join(l.dir, lastSegmentFileName)
+	lastSegmentFile, err := os.OpenFile(lastSegmentFilePath, os.O_RDONLY, 0644)
+	if err != nil {
+		log.Println("Error opening last segment file:", err)
+		return nil, err
+	}
+	return lastSegmentFile, nil
+}
+
+func (l *WAL) rollToNewSegment() error {
+	// 1. Close the current segment. Note that fsync() has been invoked.s
+	err := l.activeFile.Close()
+	if err != nil {
+		return err
+	}
+	// 2. Open a new segment file.
+	newSegmentID := l.activeSegmentID + 1
+	newSegmentFileName := getWalFileNameFromSegmentID(newSegmentID)
+	newSegmentFilePath := filepath.Join(l.dir, newSegmentFileName)
+	newSegmentFile, err := os.OpenFile(newSegmentFilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+
+	// 3. Update the active file and segment ID.
+	l.activeFile = newSegmentFile
+	l.activeSegmentID = newSegmentID
+
+	// 4. Return nil.
+	return nil
+}
+
+// recoverNextRecord reads the next record from the WAL file.
+// It returns the record and the sequence number of the next record.
+// It returns an error if the checksum is invalid.
+// It returns an error if the record is not found.
+// It returns an error if the file is not found.
+// It returns an error if the file is not readable.
+// It returns an error if the file is not seekable.
 func recoverNextRecord(reader io.Reader) (*LogRecord, error) {
 	buf := make([]byte, headerSize)
 
 	_, err := io.ReadFull(reader, buf)
 	if err != nil {
 		// EOF is handled
+		if err != io.EOF {
+			log.Println("Error reading next WAL record:", err)
+		}
 		return nil, err
 	}
 
@@ -103,6 +197,9 @@ func recoverNextRecord(reader io.Reader) (*LogRecord, error) {
 	payloadBuf := make([]byte, keyValueSize)
 	_, err = io.ReadFull(reader, payloadBuf)
 	if err != nil {
+		if err != io.EOF {
+			log.Println("Error reading next WAL record:", err)
+		}
 		return nil, err
 	}
 
@@ -111,6 +208,7 @@ func recoverNextRecord(reader io.Reader) (*LogRecord, error) {
 	computedChecksum := ComputeChecksum(dataToVerify)
 	if computedChecksum != checksum {
 		// Bad checksum.
+		log.Println("Error reading next WAL record: checksum mismatch")
 		return nil, ErrBadChecksum
 	}
 
@@ -132,5 +230,5 @@ func (l *WAL) Close() error {
 	// 3. Close the file handle: l.file.Close()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.file.Close()
+	return l.activeFile.Close()
 }
