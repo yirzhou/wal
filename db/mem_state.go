@@ -1,4 +1,4 @@
-package main
+package db
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"wal/lib"
 )
 
 // MemState is a simple in-memory key-value store. It doesn't have any concurrency protection.
@@ -240,7 +241,7 @@ func getNextSparseIndexRecord(file *os.File) (*SparseIndexRecord, error) {
 	computedChecksum := ComputeChecksum(fullBytes)
 	if computedChecksum != record.Checksum {
 		log.Printf("getNextSparseIndexRecord:Error computing checksum: %d != %d\n", computedChecksum, record.Checksum)
-		return nil, ErrBadChecksum
+		return nil, lib.ErrBadChecksum
 	}
 	// Return the record.
 	return record, nil
@@ -283,7 +284,7 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	computedChecksum := ComputeChecksum(slices.Concat(keySizeBytes, valueSizeBytes, dataBytes))
 	if computedChecksum != checksum {
 		// log.Println("getNextKVRecord:Error computing checksum:", computedChecksum, "!=", checksum)
-		return KVRecord{}, ErrBadChecksum
+		return KVRecord{}, lib.ErrBadChecksum
 	}
 	// Return the record.
 	return KVRecord{

@@ -1,4 +1,4 @@
-package main
+package db
 
 import (
 	"fmt"
@@ -28,18 +28,18 @@ func getTestDir() string {
 	return filepath.Join("/tmp", prefix)
 }
 
-func TestKVStore(t *testing.T) {
+func TestOpen(t *testing.T) {
 	dir := getTestDir()
-	kv, err := NewKVStore(dir)
+	kv, err := Open(dir)
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
 	}
 }
 
-func TestKVStorePutGet(t *testing.T) {
+func TestPutGet(t *testing.T) {
 	dir := getTestDir()
-	kv, err := NewKVStore(dir)
+	kv, err := Open(dir)
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
@@ -48,7 +48,7 @@ func TestKVStorePutGet(t *testing.T) {
 	keyVal := make(map[string]string)
 
 	// Put 100 key-value pairs.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		key := generateRandomString(10)
 		value := generateRandomString(10)
 		kv.Put([]byte(key), []byte(value))
@@ -62,15 +62,16 @@ func TestKVStorePutGet(t *testing.T) {
 		assert.Equal(t, []byte(val), value)
 	}
 }
-func TestKVStoreRecovery(t *testing.T) {
+
+func TestRecovery(t *testing.T) {
 	dir := getTestDir()
-	kv, err := NewKVStore(dir)
+	kv, err := Open(dir)
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
 	}
 	// Put 100 key-value pairs.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
 	}
 
@@ -81,7 +82,7 @@ func TestKVStoreRecovery(t *testing.T) {
 	// Close the KVStore.
 	kv.Close()
 	// Recover the KVStore.
-	kv, err = NewKVStore(dir)
+	kv, err = Open(dir)
 	if err != nil {
 		t.Fatalf("Error recovering KVStore: %v", err)
 	}
@@ -91,7 +92,7 @@ func TestKVStoreRecovery(t *testing.T) {
 	assert.Equal(t, segmentID, kv.wal.GetCurrentSegmentID())
 
 	// Check if the key-value pairs are recovered.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
 		assert.NoError(t, err)
 		assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), value)

@@ -1,4 +1,4 @@
-package main
+package db
 
 import (
 	"encoding/binary"
@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"wal/lib"
 )
 
 const (
@@ -106,7 +107,7 @@ func (l *WAL) Append(key, value []byte) error {
 		// Special error to signal that the log has reached its size threshold.
 		// This is used to trigger a checkpoint.
 		log.Println("WAL is ready to be checkpointed; segment ID:", l.GetCurrentSegmentID())
-		return ErrCheckpointNeeded
+		return lib.ErrCheckpointNeeded
 	}
 	return nil
 }
@@ -211,7 +212,7 @@ func recoverNextRecord(reader io.Reader) (*LogRecord, error) {
 	if computedChecksum != checksum {
 		// Bad checksum.
 		log.Println("Error reading next WAL record: checksum mismatch")
-		return nil, ErrBadChecksum
+		return nil, lib.ErrBadChecksum
 	}
 
 	return &LogRecord{

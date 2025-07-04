@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"wal/db"
 )
 
 func main() {
@@ -14,7 +15,7 @@ func main() {
 	}
 	walDir := args[0]
 
-	kv, err := NewKVStore(walDir)
+	kv, err := db.Open(walDir)
 	if err != nil {
 		log.Println("Error creating KVStore:", err)
 		return

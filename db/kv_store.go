@@ -1,4 +1,4 @@
-package main
+package db
 
 import (
 	"bytes"
@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"wal/lib"
 )
 
 const (
@@ -152,7 +153,7 @@ func (kv *KVStore) Put(key, value []byte) error {
 	walErr := kv.wal.Append(key, value)
 
 	// 2. Check if the memtable is ready to be flushed (checkpoint)
-	if walErr != nil && walErr != ErrCheckpointNeeded {
+	if walErr != nil && walErr != lib.ErrCheckpointNeeded {
 		log.Println("Error writing to WAL:", walErr)
 		return walErr
 	}
@@ -165,7 +166,7 @@ func (kv *KVStore) Put(key, value []byte) error {
 	}
 
 	// 4. Check if the WAL is ready to be checkpointed
-	if walErr == ErrCheckpointNeeded {
+	if walErr == lib.ErrCheckpointNeeded {
 		// checkpoint the memtable
 		err := kv.doCheckpoint()
 		if err != nil {
@@ -280,7 +281,7 @@ func tryGetLastCheckpointFromFile(checkpointDir string) (string, error) {
 	checksum := binary.LittleEndian.Uint32(bytes[:4])
 	if checksum != ComputeChecksum(bytes[4:]) {
 		log.Println("Checksum mismatch in checkpoint file")
-		return "", ErrBadChecksum
+		return "", lib.ErrBadChecksum
 	}
 	// Return the segment file path.
 	return string(bytes[4:]), nil
@@ -690,7 +691,7 @@ func recoverFromWALFile(reader *os.File, memState *MemState, isLastWal bool) (ui
 			}
 			// If we get a bad checksum, it means the last write was torn.
 			// We stop here and trust the log up to this point.
-			if err == ErrBadChecksum || err == io.ErrUnexpectedEOF {
+			if err == lib.ErrBadChecksum || err == io.ErrUnexpectedEOF {
 				if !isLastWal {
 					// Having corruption in an intermediate WAL file is a fatal error!
 					log.Fatalf("Bad checksum or unexpected EOF in WAL file: %s", reader.Name())
@@ -781,7 +782,7 @@ func (kv *KVStore) Print() {
 	kv.memState.Print()
 }
 
-// NewKVStore opens/creates the log file and initializes the KVStore object.
+// Open opens/creates the log file and initializes the KVStore object.
 // 1. Try to get the last checkpoint file path from the checkpoint file and the WAL files.
 //
 // 2. If the checkpoint is found, open it and read the last segment file path.
@@ -801,7 +802,7 @@ func (kv *KVStore) Print() {
 // 1. Add a compaction job that removes old checkpoints and sparse index files.
 // 2. Delete API
 // 3. Recovery sparse index
-func NewKVStore(dir string) (*KVStore, error) {
+func Open(dir string) (*KVStore, error) {
 	// Create the master directory if it doesn't exist.
 	err := os.MkdirAll(dir, 0755)
 	if err != nil {
@@ -815,12 +816,12 @@ func NewKVStore(dir string) (*KVStore, error) {
 	memState := NewMemState()
 
 	if lastCheckpointFilePath != "" {
-		log.Println("NewKVStore: Last checkpoint found:", lastCheckpointFilePath)
+		log.Println("Open: Last checkpoint found:", lastCheckpointFilePath)
 		checkpointFileName := filepath.Base(lastCheckpointFilePath)
 		segmentID, err := getSegmentIDFromSegmentFileName(checkpointFileName)
 		if err != nil {
-			log.Println("NewKVStore: Error getting segment ID from last checkpoint file:", err)
-			return nil, ErrCheckpointCorrupted
+			log.Println("Open: Error getting segment ID from last checkpoint file:", err)
+			return nil, lib.ErrCheckpointCorrupted
 		}
 		lastSegmentID = segmentID
 		// // Recover memstate from checkpoint file.
@@ -833,15 +834,15 @@ func NewKVStore(dir string) (*KVStore, error) {
 		// Recover sparse index from sparse index file.
 		err = recoverFromSparseIndexFile(filepath.Join(dir, checkpointDir, getSparseIndexFileNameFromSegmentId(segmentID)), memState)
 		if err != nil {
-			log.Println("NewKVStore: Error recovering from sparse index file:", err)
-			return nil, ErrCheckpointCorrupted
+			log.Println("Open: Error recovering from sparse index file:", err)
+			return nil, lib.ErrCheckpointCorrupted
 		}
 	}
 
 	// Recover from WAL files.
 	wal, err := recoverFromWALs(lastSegmentID, filepath.Join(dir, logsDir), memState)
 	if err != nil {
-		log.Println("NewKVStore: Error recovering from WAL files:", err)
+		log.Println("Open: Error recovering from WAL files:", err)
 		return nil, err
 	}
 
