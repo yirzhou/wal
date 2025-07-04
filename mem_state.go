@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,13 +14,33 @@ import (
 
 // MemState is a simple in-memory key-value store. It doesn't have any concurrency protection.
 type MemState struct {
-	state map[string][]byte // key -> value
+	state          map[string][]byte // key -> value
+	sparseIndexMap sparseIndexes     // segmentID -> sparseIndex
 }
 
 // Pair is a key-value pair.
 type pair struct {
 	Key   string
 	Value []byte
+}
+
+// A single entry in our sparse index.
+type sparseIndexEntry struct {
+	key    []byte // The key itself
+	offset int64  // The byte offset in the segment file where this key's record begins
+}
+
+// The sparse index for one segment file.
+type sparseIndex []sparseIndexEntry
+
+type sparseIndexes map[uint64]sparseIndex
+
+// AddSparseIndexEntry adds a new entry to the sparse index.
+func (m *MemState) AddSparseIndexEntry(segmentID uint64, key []byte, offset int64) {
+	if m.sparseIndexMap[segmentID] == nil {
+		m.sparseIndexMap[segmentID] = make(sparseIndex, 0)
+	}
+	m.sparseIndexMap[segmentID] = append(m.sparseIndexMap[segmentID], sparseIndexEntry{key: key, offset: offset})
 }
 
 // GetAllSortedPairs returns all the key-value pairs in the memtable sorted by key.
@@ -36,14 +57,39 @@ func (m *MemState) GetAllSortedPairs() []pair {
 
 func NewMemState() *MemState {
 	return &MemState{
-		state: make(map[string][]byte),
+		state:          make(map[string][]byte),
+		sparseIndexMap: make(sparseIndexes),
 	}
 }
 
+// FindKeyInSparseIndex finds the offset of a key in the sparse index.
+func (m *MemState) FindKeyInSparseIndex(segmentID uint64, key []byte) int64 {
+	// We are not checking if the slice is empty. If it's empty, zero will be returned. That means that the segment file is empty.
+	// In theory, we can directly return -1 to signal that the segment file is empty as a small optimization.
+	cmp := func(a, b sparseIndexEntry) int {
+		return bytes.Compare(a.key, b.key)
+	}
+	idx, _ := slices.BinarySearchFunc(m.sparseIndexMap[segmentID], sparseIndexEntry{key: key}, cmp)
+	// Check if the key at the idx is larger than the key we are looking for. If it is larger, we need to go back one index.
+	if cmp(sparseIndexEntry{key: key}, m.sparseIndexMap[segmentID][idx]) < 0 {
+		if idx-1 >= 0 {
+			// Return the offset of the previous key.
+			idx--
+		} else {
+			// The key is smaller than the smallest key in the segment file.
+			return -1
+		}
+	}
+	return m.sparseIndexMap[segmentID][idx].offset
+}
+
+// Get returns the value for a given key.
+// If the key is not found, it returns an error.
 func (m *MemState) Get(key []byte) ([]byte, error) {
+	// Found in MemState.
 	value, ok := m.state[string(key)]
 	if !ok {
-		return nil, errors.New("key not found")
+		return nil, errors.New("key not found in memtable")
 	}
 	return value, nil
 }
@@ -71,10 +117,57 @@ func (m *MemState) createNewSegmentFile(filePath string) (*os.File, error) {
 	return segmentFile, nil
 }
 
+// GetAllSegmentFilePathsDescendingOrder gets all the segment files in the descending order of their segment IDs.
+func (m *MemState) GetAllSegmentIDsDescendingOrder() ([]uint64, error) {
+	segmentIDs := make([]uint64, 0)
+	for segmentID := range m.sparseIndexMap {
+		segmentIDs = append(segmentIDs, segmentID)
+	}
+	slices.Sort(segmentIDs)
+	slices.Reverse(segmentIDs)
+	return segmentIDs, nil
+}
+
+// FlushSparseIndex flushes the sparse index to the sparse index file.
+func (m *MemState) FlushSparseIndex(filePath string) error {
+	segmentID, err := GetSegmentIDFromIndexFilePath(filePath)
+	if err != nil {
+		log.Println("Error getting segment ID from segment file path:", err)
+		return err
+	}
+	sparseIndexFile, err := os.OpenFile(filePath, AppendFlags, 0644)
+	if err != nil {
+		log.Println("Error creating sparse index file:", err)
+		return err
+	}
+	defer sparseIndexFile.Close()
+	sparseIndexFile.Seek(0, io.SeekStart)
+	for _, entry := range m.sparseIndexMap[segmentID] {
+		sparseIndexFile.Seek(0, io.SeekCurrent)
+		_, err := sparseIndexFile.Write(GetSparseIndexBytes(segmentID, entry.key, entry.offset))
+		if err != nil {
+			log.Println("FlushSparseIndex: Error writing to sparse index file:", err)
+			return err
+		}
+	}
+	err = sparseIndexFile.Sync()
+	if err != nil {
+		log.Println("FlushSparseIndex: Error syncing sparse index file:", err)
+		return err
+	}
+	log.Println("FlushSparseIndex: Successfully flushed sparse index to file:", filePath)
+	return nil
+}
+
 // Flush flushes the memtable to the segment file.
 // It writes the entries to the segment file in sorted order.
 // TODO: It also updates the offset in the sparse index.
 func (m *MemState) Flush(filePath string) error {
+	segmentID, err := GetSegmentIDFromSegmentFilePath(filePath)
+	if err != nil {
+		log.Println("Error getting segment ID from segment file path:", err)
+		return err
+	}
 	segmentFile, err := m.createNewSegmentFile(filePath)
 	if err != nil {
 		log.Println("Error creating segment file:", err)
@@ -88,13 +181,24 @@ func (m *MemState) Flush(filePath string) error {
 		return err
 	}
 	entries := m.GetAllSortedPairs()
-	for _, entry := range entries {
+	offset := int64(0)
+	for idx, entry := range entries {
 		bytes := getKVRecordBytes([]byte(entry.Key), entry.Value)
 		_, err := segmentFile.Write(bytes)
 		if err != nil {
 			log.Println("Error writing to segment file:", err)
 			return err
 		}
+		// Update the sparse index every 2 records.
+		if idx%2 == 0 {
+			log.Println("Creating sparse index for segment:", segmentID, "with offset:", offset, "and key:", entry.Key)
+			// Create a new file name -> sparse index map.
+			if m.sparseIndexMap[segmentID] == nil {
+				m.sparseIndexMap[segmentID] = make(sparseIndex, 0)
+			}
+			m.sparseIndexMap[segmentID] = append(m.sparseIndexMap[segmentID], sparseIndexEntry{key: []byte(entry.Key), offset: offset})
+		}
+		offset += int64(len(bytes))
 	}
 	// Sync the segment file to ensure all data is written to disk.
 	err = segmentFile.Sync()
@@ -102,7 +206,44 @@ func (m *MemState) Flush(filePath string) error {
 		log.Println("Error flushing to segment file:", err)
 		return err
 	}
+
 	return nil
+}
+
+// getNextSparseIndexRecord reads the next sparse index record from the file.
+func getNextSparseIndexRecord(file *os.File) (*SparseIndexRecord, error) {
+	headerBytes := make([]byte, 24)
+	_, err := file.Read(headerBytes)
+	if err != nil {
+		if err == io.EOF {
+			// no more records
+			return nil, nil
+		}
+		log.Println("getNextSparseIndexRecord:Error reading sparse index header:", err)
+		return nil, err
+	}
+	record, err := DecodeSparseIndexHeader(headerBytes)
+	if err != nil {
+		log.Println("getNextSparseIndexRecord:Error decoding sparse index header:", err)
+		return nil, err
+	}
+	record.Key = make([]byte, record.KeySize)
+	_, err = file.Read(record.Key)
+	if err != nil {
+		log.Println("getNextSparseIndexRecord:Error reading sparse index key:", err)
+		return nil, err
+	}
+
+	// Combine the header and the key to get the full record.
+	fullBytes := append(headerBytes[4:], record.Key...)
+	// Check the checksum.
+	computedChecksum := ComputeChecksum(fullBytes)
+	if computedChecksum != record.Checksum {
+		log.Printf("getNextSparseIndexRecord:Error computing checksum: %d != %d\n", computedChecksum, record.Checksum)
+		return nil, ErrBadChecksum
+	}
+	// Return the record.
+	return record, nil
 }
 
 // getNextKVRecord reads the next KV record from the file.
@@ -111,6 +252,7 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	checksumBytes := make([]byte, 4)
 	_, err := file.Read(checksumBytes)
 	if err != nil {
+		// log.Println("getNextKVRecord:Error reading checksum:", err)
 		return KVRecord{}, err
 	}
 	checksum := binary.LittleEndian.Uint32(checksumBytes)
@@ -118,6 +260,7 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	keySizeBytes := make([]byte, 4)
 	_, err = file.Read(keySizeBytes)
 	if err != nil {
+		// log.Println("getNextKVRecord:Error reading key size:", err)
 		return KVRecord{}, err
 	}
 	keySize := binary.LittleEndian.Uint32(keySizeBytes)
@@ -125,6 +268,7 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	valueSizeBytes := make([]byte, 4)
 	_, err = file.Read(valueSizeBytes)
 	if err != nil {
+		// log.Println("getNextKVRecord:Error reading value size:", err)
 		return KVRecord{}, err
 	}
 	valueSize := binary.LittleEndian.Uint32(valueSizeBytes)
@@ -132,11 +276,13 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	dataBytes := make([]byte, keySize+valueSize)
 	_, err = file.Read(dataBytes)
 	if err != nil {
+		// log.Println("getNextKVRecord:Error reading key + value:", err)
 		return KVRecord{}, err
 	}
 	// Compute the checksum.
 	computedChecksum := ComputeChecksum(slices.Concat(keySizeBytes, valueSizeBytes, dataBytes))
 	if computedChecksum != checksum {
+		// log.Println("getNextKVRecord:Error computing checksum:", computedChecksum, "!=", checksum)
 		return KVRecord{}, ErrBadChecksum
 	}
 	// Return the record.

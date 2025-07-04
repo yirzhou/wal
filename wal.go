@@ -14,8 +14,8 @@ const (
 	headerSize   = 20
 	checksumSize = 4
 	// CheckpointSize = 64 * 1024 // 64KiB
-	CheckpointSize = 8 // 8 bytes for testing
-	flags          = os.O_RDWR | os.O_CREATE | os.O_APPEND
+	CheckpointSize = 1024 // 1KiB for testing
+	AppendFlags    = os.O_RDWR | os.O_CREATE | os.O_APPEND
 )
 
 type WAL struct {
@@ -103,18 +103,17 @@ func (l *WAL) Append(key, value []byte) error {
 
 	// 6. Check if the segment size has been reached. If so, roll to a new segment
 	if fileInfo.Size() >= l.segmentSize {
-		// If the segment size has been reached, roll to a new segment
-		err = l.rollToNewSegment()
-		if err != nil {
-			log.Println("Error rolling to a new segment:", err)
-			return err
-		}
-
 		// Special error to signal that the log has reached its size threshold.
 		// This is used to trigger a checkpoint.
+		log.Println("WAL is ready to be checkpointed; segment ID:", l.GetCurrentSegmentID())
 		return ErrCheckpointNeeded
 	}
 	return nil
+}
+
+// GetCurrentSegmentID returns the ID of the current segment.
+func (l *WAL) GetCurrentSegmentID() uint64 {
+	return l.activeSegmentID
 }
 
 func (l *WAL) GetLastSegmentID() uint64 {
@@ -144,8 +143,9 @@ func (l *WAL) GetLastSegmentFile() (*os.File, error) {
 	return lastSegmentFile, nil
 }
 
-func (l *WAL) rollToNewSegment() error {
-	// 1. Close the current segment. Note that fsync() has been invoked.s
+// RollToNewSegment rolls to a new segment.
+func (l *WAL) RollToNewSegment() error {
+	// 1. Close the current segment.
 	err := l.activeFile.Close()
 	if err != nil {
 		return err
@@ -162,6 +162,8 @@ func (l *WAL) rollToNewSegment() error {
 	// 3. Update the active file and segment ID.
 	l.activeFile = newSegmentFile
 	l.activeSegmentID = newSegmentID
+
+	log.Println("rollToNewSegment: Rolled to new segment:", newSegmentID)
 
 	// 4. Return nil.
 	return nil

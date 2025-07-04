@@ -22,16 +22,19 @@ func main() {
 	defer kv.Close()
 	kv.Print()
 
-	// kv.Put([]byte("key-1"), []byte("value1"))
-	// kv.Put([]byte("key-2"), []byte("value2"))
-	// kv.Put([]byte("key-3"), []byte("value3"))
-	// kv.Put([]byte("key-4"), []byte("value4"))
-	// kv.Put([]byte("key-5"), []byte("value5"))
-	// kv.Put([]byte("key-6"), []byte("value6"))
-	// kv.Put([]byte("key-7"), []byte("value7"))
-	// kv.Put([]byte("key-8"), []byte("value8"))
+	// for i := 0; i < 100; i++ {
+	// 	kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+	// }
 
 	// kv.Put([]byte(""), []byte("value2"))
 	// kv.Put([]byte("color"), []byte(""))
 	// kv.Put([]byte("key-1"), []byte("some utf-8 chars ✨ or binary data \x00\x01\x02"))
+
+	for i := 0; i < 100; i++ {
+		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+		if err != nil {
+			log.Printf("Error getting key-%d: %v\n", i, err)
+		}
+		log.Printf("kv.Get(\"key-%d\"): %v\n", i, string(value))
+	}
 }
