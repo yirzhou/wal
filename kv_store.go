@@ -230,6 +230,20 @@ func getSparseIndexFileNameFromSegmentId(segmentId uint64) string {
 
 // tryGetLastCheckpoint tries to get the last checkpoint file path from the checkpoint file and the WAL files.
 func tryGetLastCheckpoint(checkpointDir, walDir string) string {
+	// Create the checkpoint directory if it doesn't exist.
+	err := os.MkdirAll(checkpointDir, 0755)
+	if err != nil {
+		log.Println("Error creating checkpoint directory:", err)
+		return ""
+	}
+
+	// Create the WAL directory if it doesn't exist.
+	err = os.MkdirAll(walDir, 0755)
+	if err != nil {
+		log.Println("Error creating WAL directory:", err)
+		return ""
+	}
+
 	checkpointFilePath, _ := tryGetLastCheckpointFromFile(checkpointDir)
 	if checkpointFilePath != "" {
 		return checkpointFilePath
@@ -719,6 +733,43 @@ func (kv *KVStore) Close() error {
 	return kv.wal.Close()
 }
 
+func (kv *KVStore) CloseAndCleanUp() error {
+	err := kv.Close()
+	if err != nil {
+		log.Println("CloseAndCleanUp: Error closing WAL:", err)
+		return err
+	}
+	err = kv.CleanUpDirectories()
+	if err != nil {
+		log.Println("CloseAndCleanUp: Error cleaning up directories:", err)
+		return err
+	}
+	return nil
+}
+
+// CleanUpDirectories cleans up the checkpoint and WAL directories.
+func (kv *KVStore) CleanUpDirectories() error {
+	checkpointDir := filepath.Join(kv.dir, checkpointDir)
+	walDir := filepath.Join(kv.dir, logsDir)
+	err := os.RemoveAll(checkpointDir)
+	if err != nil {
+		log.Println("CleanUpDirectories: Error cleaning up checkpoint directory:", err)
+		return err
+	}
+	err = os.RemoveAll(walDir)
+	if err != nil {
+		log.Println("CleanUpDirectories: Error cleaning up WAL directory:", err)
+		return err
+	}
+	// Delete the master directory.
+	err = os.RemoveAll(kv.dir)
+	if err != nil {
+		log.Println("CleanUpDirectories: Error cleaning up master directory:", err)
+		return err
+	}
+	return nil
+}
+
 // GetLastSequenceNum returns the last sequence number.
 func (kv *KVStore) GetLastSequenceNum() uint64 {
 	return kv.wal.lastSequenceNum
@@ -751,6 +802,12 @@ func (kv *KVStore) Print() {
 // 2. Delete API
 // 3. Recovery sparse index
 func NewKVStore(dir string) (*KVStore, error) {
+	// Create the master directory if it doesn't exist.
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		log.Fatalf("Error creating master directory: %v", err)
+	}
+
 	// Read the checkpoint if exists.
 	lastCheckpointFilePath := tryGetLastCheckpoint(filepath.Join(dir, checkpointDir), filepath.Join(dir, logsDir))
 	lastSegmentID := uint64(0)

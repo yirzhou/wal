@@ -2,3 +2,4 @@
 *.txt
 logs
 checkpoints
+wal
