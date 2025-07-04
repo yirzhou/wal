@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -30,7 +31,7 @@ func getTestDir() string {
 
 func TestOpen(t *testing.T) {
 	dir := getTestDir()
-	kv, err := Open(dir)
+	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
@@ -39,7 +40,7 @@ func TestOpen(t *testing.T) {
 
 func TestPutGet(t *testing.T) {
 	dir := getTestDir()
-	kv, err := Open(dir)
+	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
@@ -63,9 +64,9 @@ func TestPutGet(t *testing.T) {
 	}
 }
 
-func TestRecovery(t *testing.T) {
+func TestRecoveryNormal(t *testing.T) {
 	dir := getTestDir()
-	kv, err := Open(dir)
+	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
@@ -82,7 +83,7 @@ func TestRecovery(t *testing.T) {
 	// Close the KVStore.
 	kv.Close()
 	// Recover the KVStore.
-	kv, err = Open(dir)
+	kv, err = Open(NewDefaultConfiguration().WithBaseDir(dir))
 	if err != nil {
 		t.Fatalf("Error recovering KVStore: %v", err)
 	}
@@ -90,6 +91,180 @@ func TestRecovery(t *testing.T) {
 	// Check if the last sequence number and current segment ID are the same.
 	assert.Equal(t, lastSequenceNum, kv.GetLastSequenceNum())
 	assert.Equal(t, segmentID, kv.wal.GetCurrentSegmentID())
+
+	// Check if the key-value pairs are recovered.
+	for i := range 100 {
+		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), value)
+	}
+}
+
+func TestRecoveryWithCorruptedWALFile(t *testing.T) {
+	dir := getTestDir()
+	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	if err != nil {
+		t.Fatalf("Error creating KVStore: %v", err)
+	}
+
+	// Put 100 key-value pairs.
+	for i := range 100 {
+		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	segmentID := kv.wal.GetCurrentSegmentID()
+
+	// Close the DB
+	kv.Close()
+
+	// Corrupt the last bit of the latest WAL file.
+	walFilePath := filepath.Join(dir, "/logs/"+getWalFileNameFromSegmentID(segmentID))
+	stat, err := os.Stat(walFilePath)
+	if err != nil {
+		t.Fatalf("Error getting file size: %v", err)
+	}
+	os.Truncate(walFilePath, stat.Size()-1)
+
+	// The database should be recovered from all segments and WALs.
+	// The last bit will only corrupt the last record in the WAL file, which is the "key-99" record.
+	// So the key-value pairs from 0 to 98 should be recovered, but the key-value pair for "key-99" should be lost.
+	kv, err = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	defer kv.CloseAndCleanUp()
+	if err != nil {
+		t.Fatalf("Error recovering KVStore: %v", err)
+	}
+
+	// Check if the key-value pairs are recovered.
+	for i := range 99 {
+		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), value)
+	}
+	// Check if the key-value pair for "key-99" is lost.
+	value, err := kv.Get([]byte("key-99"))
+	assert.NoError(t, err)
+	assert.Nil(t, value)
+}
+
+func TestRecoveryWithCorruptedSparseIndexFile(t *testing.T) {
+	dir := getTestDir()
+	kv, _ := Open(NewDefaultConfiguration().WithBaseDir(dir))
+
+	// Put 100 key-value pairs.
+	for i := range 100 {
+		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	segmentID := kv.wal.GetLastSegmentID()
+
+	// Close the DB
+	kv.Close()
+
+	// Corrupt the sparse index file.
+	sparseIndexFilePath := filepath.Join(dir, "/checkpoints/"+getSparseIndexFileNameFromSegmentId(segmentID))
+	stat, _ := os.Stat(sparseIndexFilePath)
+	os.Truncate(sparseIndexFilePath, stat.Size()-1)
+
+	// The database should be recovered from all segments and WALs.
+	kv, _ = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	defer kv.CloseAndCleanUp()
+
+	// Check if the key-value pairs are recovered.
+	for i := range 100 {
+		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), value)
+	}
+}
+
+func TestRecoveryWithCorruptedCheckpoint(t *testing.T) {
+	dir := getTestDir()
+	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	if err != nil {
+		t.Fatalf("Error creating KVStore: %v", err)
+	}
+
+	// Put 100 key-value pairs.
+	for i := range 100 {
+		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	// Close the DB
+	kv.Close()
+
+	// Corrupt the checkpoint file.
+	checkpointFilePath := filepath.Join(dir, "/checkpoints/CHECKPOINT")
+	os.Truncate(checkpointFilePath, 0)
+
+	// The database should be recovered from all segments and WALs.
+	kv, err = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	defer kv.CloseAndCleanUp()
+	if err != nil {
+		t.Fatalf("Error recovering KVStore: %v", err)
+	}
+
+	// Check if the key-value pairs are stored.
+	for i := range 100 {
+		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), value)
+	}
+}
+
+func TestRecoveryNormalWithVariousCheckpointSizes(t *testing.T) {
+	checkpointSize := 1024
+	for checkpointSize <= 1024*1024 {
+		dir := getTestDir()
+		kv, _ := Open(NewDefaultConfiguration().WithBaseDir(dir).WithCheckpointSize(int64(checkpointSize)))
+
+		// Put 100 key-value pairs.
+		for i := range 100 {
+			kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+		}
+
+		// Close the DB
+		kv.Close()
+
+		// Recover the DB
+		kv, _ = Open(NewDefaultConfiguration().WithBaseDir(dir).WithCheckpointSize(int64(checkpointSize)))
+		defer kv.CloseAndCleanUp()
+
+		// Check if the key-value pairs are recovered.
+		for i := range 100 {
+			value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+			assert.NoError(t, err)
+			assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), value, "checkpointSize: %d, key: %s, value: %s", checkpointSize, fmt.Sprintf("key-%d", i), fmt.Sprintf("value-%d", i))
+		}
+		checkpointSize *= 2
+	}
+}
+
+func TestDelete(t *testing.T) {
+	dir := getTestDir()
+	kv, _ := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	defer kv.CloseAndCleanUp()
+
+	// Put 100 key-value pairs.
+	for i := range 100 {
+		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	// Delete 100 key-value pairs.
+	for i := range 100 {
+		kv.Delete([]byte(fmt.Sprintf("key-%d", i)))
+	}
+
+	// Check if the key-value pairs are deleted.
+	for i := range 100 {
+		value, err := kv.Get([]byte(fmt.Sprintf("key-%d", i)))
+		assert.NoError(t, err)
+		assert.Nil(t, value)
+	}
+
+	// Put 100 key-value pairs again.
+	for i := range 100 {
+		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
+	}
 
 	// Check if the key-value pairs are recovered.
 	for i := range 100 {

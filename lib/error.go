@@ -11,3 +11,6 @@ var ErrCheckpointNeeded = errors.New("checkpoint needed")
 
 // ErrCheckpointCorrupted is returned when the checkpoint file is corrupted (e.g., edited in the middle, or bit-flipped).
 var ErrCheckpointCorrupted = errors.New("checkpoint corrupted")
+
+// ErrSparseIndexCorrupted is returned when the sparse index file is corrupted (e.g., edited in the middle, or bit-flipped).
+var ErrSparseIndexCorrupted = errors.New("sparse index corrupted")

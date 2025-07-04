@@ -71,6 +71,11 @@ func (m *MemState) FindKeyInSparseIndex(segmentID uint64, key []byte) int64 {
 		return bytes.Compare(a.key, b.key)
 	}
 	idx, _ := slices.BinarySearchFunc(m.sparseIndexMap[segmentID], sparseIndexEntry{key: key}, cmp)
+
+	// If the key is larger than the largest key in the segment file, go back by one index.
+	if idx == len(m.sparseIndexMap[segmentID]) {
+		idx--
+	}
 	// Check if the key at the idx is larger than the key we are looking for. If it is larger, we need to go back one index.
 	if cmp(sparseIndexEntry{key: key}, m.sparseIndexMap[segmentID][idx]) < 0 {
 		if idx-1 >= 0 {
@@ -253,7 +258,9 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	checksumBytes := make([]byte, 4)
 	_, err := file.Read(checksumBytes)
 	if err != nil {
-		// log.Println("getNextKVRecord:Error reading checksum:", err)
+		if err != io.EOF {
+			log.Println("getNextKVRecord:Error reading checksum:", err)
+		}
 		return KVRecord{}, err
 	}
 	checksum := binary.LittleEndian.Uint32(checksumBytes)
@@ -261,7 +268,7 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	keySizeBytes := make([]byte, 4)
 	_, err = file.Read(keySizeBytes)
 	if err != nil {
-		// log.Println("getNextKVRecord:Error reading key size:", err)
+		log.Println("getNextKVRecord:Error reading key size:", err)
 		return KVRecord{}, err
 	}
 	keySize := binary.LittleEndian.Uint32(keySizeBytes)
@@ -269,7 +276,7 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	valueSizeBytes := make([]byte, 4)
 	_, err = file.Read(valueSizeBytes)
 	if err != nil {
-		// log.Println("getNextKVRecord:Error reading value size:", err)
+		log.Println("getNextKVRecord:Error reading value size:", err)
 		return KVRecord{}, err
 	}
 	valueSize := binary.LittleEndian.Uint32(valueSizeBytes)
@@ -277,13 +284,13 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	dataBytes := make([]byte, keySize+valueSize)
 	_, err = file.Read(dataBytes)
 	if err != nil {
-		// log.Println("getNextKVRecord:Error reading key + value:", err)
+		log.Println("getNextKVRecord:Error reading key + value:", err)
 		return KVRecord{}, err
 	}
 	// Compute the checksum.
 	computedChecksum := ComputeChecksum(slices.Concat(keySizeBytes, valueSizeBytes, dataBytes))
 	if computedChecksum != checksum {
-		// log.Println("getNextKVRecord:Error computing checksum:", computedChecksum, "!=", checksum)
+		log.Println("getNextKVRecord:Error computing checksum:", computedChecksum, "!=", checksum)
 		return KVRecord{}, lib.ErrBadChecksum
 	}
 	// Return the record.
@@ -296,31 +303,34 @@ func getNextKVRecord(file *os.File) (KVRecord, error) {
 	}, nil
 }
 
-// recoverFromCheckpoint recovers the memtable from a checkpoint file.
+// tryRecoverFromCheckpoint recovers the memtable from a checkpoint file.
 // Each record is in the format of: checksum + key size + value size + key + value.
-func recoverFromCheckpoint(checkpointFilePath string) (*MemState, error) {
+func tryRecoverFromCheckpoint(checkpointFilePath string) (*MemState, error) {
 	memState := NewMemState()
 	file, err := os.Open(checkpointFilePath)
 	if err != nil {
-		log.Println("Error opening checkpoint file:", err)
+		log.Println("tryRecoverFromCheckpoint:Error opening checkpoint file:", err)
 		return nil, err
 	}
 	defer file.Close()
 	_, err = file.Seek(0, io.SeekStart)
 	if err != nil {
-		log.Println("Error seeking to start:", err)
+		log.Println("tryRecoverFromCheckpoint:Error seeking to start:", err)
 		return nil, err
 	}
+	offset := int64(0)
 	for {
-		_, err := file.Seek(0, io.SeekCurrent)
+		offset, err = file.Seek(0, io.SeekCurrent)
 		if err != nil {
-			log.Println("Error seeking to current position:", err)
+			log.Println("tryRecoverFromCheckpoint:Error seeking to current position:", err)
 			break
 		}
 		record, err := getNextKVRecord(file)
 		if err != nil {
 			if err != io.EOF {
-				log.Println("Error getting next KV record:", err)
+				log.Println("tryRecoverFromCheckpoint:Error getting next KV record:", err)
+				// Truncate the file to the last good offset.
+				os.Truncate(checkpointFilePath, offset)
 			}
 			break
 		}

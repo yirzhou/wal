@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,6 +40,116 @@ type KVStore struct {
 	wal      *WAL
 	memState *MemState
 	dir      string
+}
+
+// Get returns the value for a given key. The value is nil if the key is not found.
+func (kv *KVStore) Get(key []byte) ([]byte, error) {
+	kv.lock.RLock()
+	defer kv.lock.RUnlock()
+	value, err := kv.memState.Get(key)
+	if err == nil {
+		// Directly return the value from the memtable.
+		log.Printf("Get: Found key [%s] in memtable with value [%s]\n", string(key), string(value))
+
+	} else {
+		// Search in the segment files.
+		segmentIDs, err := kv.memState.GetAllSegmentIDsDescendingOrder()
+		if err != nil {
+			log.Println("Get: Error getting all segment files:", err)
+			return nil, err
+		}
+		log.Println("Get: Searching in segment files:", segmentIDs)
+		for _, segmentID := range segmentIDs {
+			offset := kv.memState.FindKeyInSparseIndex(segmentID, key)
+			if offset == -1 {
+				// The segment file does contain the key.
+				continue
+			}
+			segmentFilePath := filepath.Join(kv.dir, checkpointDir, getSegmentFileNameFromSegmentId(segmentID))
+			value, err = kv.searchInSegmentFile(segmentFilePath, offset, key)
+			if err != nil {
+				// Technically we shouldn't get an error here.
+				log.Printf("Get: Error searching in segment file: %v\n", err)
+				return nil, err
+			}
+			// This is the value we are looking for since we are searching in the segment files in descending order.
+			if value != nil {
+				log.Println("Get: Found key in segment file:", string(key))
+				break
+			}
+		}
+	}
+	// At this point, the value is nil if the key is not found in the segment files.
+	if value == nil {
+		log.Println("Get: Key not found in segment files:", string(key))
+	} else {
+		// If the value is a tombstone, it means the key is deleted.
+		if bytes.Equal(value, lib.TOMBSTONE) {
+			log.Println("Get: Key is a tombstone:", string(key))
+			value = nil
+		}
+	}
+	return value, nil
+}
+
+// Put writes a key-value pair to the KVStore.
+func (kv *KVStore) Put(key, value []byte) error {
+	// Makes sure that the key and value are not nil.
+	if key == nil || value == nil || bytes.Equal(key, lib.CHECKPOINT) || bytes.Equal(value, lib.TOMBSTONE) {
+		log.Printf("Put: Invalid key or value: %s, %s\n", string(key), string(value))
+		return errors.New("invalid key or value")
+	}
+	return kv.putInternal(key, value)
+}
+
+// putInternal is the internal implementation of the Put method.
+func (kv *KVStore) putInternal(key, value []byte) error {
+	kv.lock.Lock()
+	defer kv.lock.Unlock()
+
+	// 1. Write to WAL
+	walErr := kv.wal.Append(key, value)
+
+	// 2. Check if the memtable is ready to be flushed (checkpoint)
+	if walErr != nil && walErr != lib.ErrCheckpointNeeded {
+		log.Println("Error writing to WAL:", walErr)
+		return walErr
+	}
+
+	// 3. Update Memtable
+	memStateErr := kv.memState.Put(key, value)
+	if memStateErr != nil {
+		log.Println("Error updating Memtable:", memStateErr)
+		return memStateErr
+	}
+
+	// 4. Check if the WAL is ready to be checkpointed
+	if walErr == lib.ErrCheckpointNeeded {
+		// checkpoint the memtable
+		err := kv.doCheckpoint()
+		if err != nil {
+			log.Println("Error checkpointing:", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// Delete deletes a key-value pair from the KVStore.
+// It writes a tombstone to the WAL and the memtable.
+// TODO: It also updates the offset in the sparse index.
+func (kv *KVStore) Delete(key []byte) error {
+	// Ensures that the key is not CHECKPOINT.
+	if bytes.Equal(key, lib.CHECKPOINT) {
+		log.Printf("Delete: Invalid key: %s\n", string(key))
+		return errors.New("invalid key")
+	}
+	err := kv.putInternal(key, lib.TOMBSTONE)
+	if err != nil {
+		log.Printf("Delete: Error [%v] deleting key [%s]\n", err, string(key))
+		return err
+	}
+	return nil
 }
 
 // compareWalFilesAscending compares two WAL file names in ascending order.
@@ -104,77 +215,6 @@ func (kv *KVStore) searchInSegmentFile(segmentFilePath string, offset int64, key
 		}
 	}
 	return value, nil
-}
-
-// Get returns the value for a given key.
-func (kv *KVStore) Get(key []byte) ([]byte, error) {
-	kv.lock.RLock()
-	defer kv.lock.RUnlock()
-	value, err := kv.memState.Get(key)
-	if err == nil {
-		// Directly return the value from the memtable.
-		log.Println("Get: Found key in memtable:", string(key))
-		return value, nil
-	} else {
-		segmentIDs, err := kv.memState.GetAllSegmentIDsDescendingOrder()
-		if err != nil {
-			log.Println("Get: Error getting all segment files:", err)
-			return nil, err
-		}
-		log.Println("Get: Searching in segment files:", segmentIDs)
-		for _, segmentID := range segmentIDs {
-			offset := kv.memState.FindKeyInSparseIndex(segmentID, key)
-			if offset == -1 {
-				// The segment file does contain the key.
-				continue
-			}
-			segmentFilePath := filepath.Join(kv.dir, checkpointDir, getSegmentFileNameFromSegmentId(segmentID))
-			value, err := kv.searchInSegmentFile(segmentFilePath, offset, key)
-			if err != nil {
-				// Technically we shouldn't get an error here.
-				log.Fatalln("Get: Error searching in segment file:", err)
-			}
-			if value != nil {
-				log.Println("Get: Found key in segment file:", string(key))
-				return value, nil
-			}
-		}
-		log.Println("Get: Key not found in segment files:", string(key))
-		return nil, nil
-	}
-}
-
-// Put writes a key-value pair to the KVStore.
-func (kv *KVStore) Put(key, value []byte) error {
-	kv.lock.Lock()
-	defer kv.lock.Unlock()
-
-	// 1. Write to WAL
-	walErr := kv.wal.Append(key, value)
-
-	// 2. Check if the memtable is ready to be flushed (checkpoint)
-	if walErr != nil && walErr != lib.ErrCheckpointNeeded {
-		log.Println("Error writing to WAL:", walErr)
-		return walErr
-	}
-
-	// 3. Update Memtable
-	memStateErr := kv.memState.Put(key, value)
-	if memStateErr != nil {
-		log.Println("Error updating Memtable:", memStateErr)
-		return memStateErr
-	}
-
-	// 4. Check if the WAL is ready to be checkpointed
-	if walErr == lib.ErrCheckpointNeeded {
-		// checkpoint the memtable
-		err := kv.doCheckpoint()
-		if err != nil {
-			log.Println("Error checkpointing:", err)
-			return err
-		}
-	}
-	return nil
 }
 
 // getSegmentIDFromWalFileName returns the segment ID from a WAL file name.
@@ -277,6 +317,12 @@ func tryGetLastCheckpointFromFile(checkpointDir string) (string, error) {
 		log.Println("Error reading checkpoint file:", err)
 		return "", err
 	}
+	// Check the bytes length.
+	if len(bytes) < 4 {
+		log.Println("Checkpoint file is too short")
+		return "", lib.ErrCheckpointCorrupted
+	}
+
 	// Verify the checksum of the file.
 	checksum := binary.LittleEndian.Uint32(bytes[:4])
 	if checksum != ComputeChecksum(bytes[4:]) {
@@ -320,7 +366,7 @@ func getLastCheckpointFilePathFromWalFile(walFilePath string) (string, error) {
 			break
 		}
 		// Return the segment file path. If the record is not a CHECKPOINT record, return an empty string.
-		if string(record.Key) == "$CHECKPOINT" {
+		if string(record.Key) == string(lib.CHECKPOINT) {
 			log.Println("Found CHECKPOINT record in WAL file:", walFilePath)
 			lastCheckpointFilePath = string(record.Value)
 			// Keep updating the last checkpoint file.
@@ -333,6 +379,7 @@ func getLastCheckpointFilePathFromWalFile(walFilePath string) (string, error) {
 func tryGetLastCheckpointFromWalFiles(walDir string) (string, error) {
 	walFiles, err := listWALFiles(walDir)
 	if err != nil {
+		log.Println("tryGetLastCheckpointFromWalFiles: Error listing WAL files:", err)
 		return "", err
 	}
 	// Sort all files by segment ID in reverse order.
@@ -340,13 +387,13 @@ func tryGetLastCheckpointFromWalFiles(walDir string) (string, error) {
 	slices.Reverse(walFiles)
 	// Get the last checkpoint file path from the WAL files (reverse order).
 	for _, walFile := range walFiles {
-		checkpointFilePath := filepath.Join(walDir, walFile)
-		checkpointFilePath, err := getLastCheckpointFilePathFromWalFile(checkpointFilePath)
+		walPath := filepath.Join(walDir, walFile)
+		walPath, err := getLastCheckpointFilePathFromWalFile(walPath)
 		if err != nil {
-			log.Println("Error getting last checkpoint file path from WAL file:", err)
+			log.Println("tryGetLastCheckpointFromWalFiles: Error getting last checkpoint file path from WAL file:", err)
 			// Skip this file.
-		} else if checkpointFilePath != "" {
-			return checkpointFilePath, nil
+		} else if walPath != "" {
+			return walPath, nil
 		}
 	}
 	return "", nil
@@ -417,15 +464,13 @@ func (kv *KVStore) cleanUpWALFiles(lastSegmentID uint64) error {
 }
 
 // getNewSegmentFilePath returns the path to the next segment file.
-func (kv *KVStore) getNewSegmentFilePath() string {
-	segmentID := kv.wal.GetCurrentSegmentID()
+func (kv *KVStore) getSegmentFilePath(segmentID uint64) string {
 	segmentFileName := getSegmentFileNameFromSegmentId(segmentID)
 	return filepath.Join(kv.dir, checkpointDir, segmentFileName)
 }
 
 // getNewSparseIndexFilePath returns the path to the next sparse index file.
-func (kv *KVStore) getNewSparseIndexFilePath() string {
-	segmentID := kv.wal.GetCurrentSegmentID()
+func (kv *KVStore) getSparseIndexFilePath(segmentID uint64) string {
 	sparseIndexFileName := getSparseIndexFileNameFromSegmentId(segmentID)
 	return filepath.Join(kv.dir, checkpointDir, sparseIndexFileName)
 }
@@ -446,49 +491,51 @@ func (kv *KVStore) doCheckpoint() error {
 		return err
 	}
 
-	// 1. Persist the memtable to a new segment file.
-	segmentFilePath := kv.getNewSegmentFilePath()
+	segmentID := kv.wal.GetCurrentSegmentID()
 
-	// 2. Append a special CHECKPOINT record to the WAL.
-	kv.wal.Append([]byte("$CHECKPOINT"), []byte(segmentFilePath))
-
-	// 3. Persist the memtable to a new segment file.
-	err = kv.memState.Flush(segmentFilePath)
-	if err != nil {
-		log.Println("Error flushing memtable to segment file:", err)
-		return err
-	}
-
-	// 4. Persist the sparse index to a new sparse index file.
-	sparseIndexFilePath := kv.getNewSparseIndexFilePath()
-	err = kv.memState.FlushSparseIndex(sparseIndexFilePath)
-	if err != nil {
-		log.Println("Error flushing sparse index to sparse index file:", err)
-		return err
-	}
-
-	// 5. Atomically update a CHECKPOINT file which records the last segment file path.
-	err = kv.updateCheckpointFile(segmentFilePath)
-	if err != nil {
-		log.Println("Error updating checkpoint file:", err)
-		return err
-	}
-
-	// 6. Remove all old WAL files. This process can be done in the background without holding back the main thread.
-	err = kv.cleanUpWALFiles(kv.wal.GetCurrentSegmentID())
-	if err != nil {
-		log.Println("Error cleaning up WAL files:", err)
-		return err
-	}
-
-	// 6. Roll to a new segment.
+	// 2. Roll to a new segment.
 	err = kv.wal.RollToNewSegment()
 	if err != nil {
 		log.Println("Error rolling to a new segment:", err)
 		return err
 	}
 
-	// TODO: 6. Remove all old checkpoints via compaction.
+	// 1. Persist the memtable to a new segment file.
+	segmentFilePath := kv.getSegmentFilePath(segmentID)
+
+	// 3. Append a special CHECKPOINT record to the WAL.
+	kv.wal.Append([]byte(lib.CHECKPOINT), []byte(segmentFilePath))
+
+	// 4. Persist the memtable to a new segment file.
+	err = kv.memState.Flush(segmentFilePath)
+	if err != nil {
+		log.Println("Error flushing memtable to segment file:", err)
+		return err
+	}
+
+	// 5. Persist the sparse index to a new sparse index file.
+	sparseIndexFilePath := kv.getSparseIndexFilePath(segmentID)
+	err = kv.memState.FlushSparseIndex(sparseIndexFilePath)
+	if err != nil {
+		log.Println("Error flushing sparse index to sparse index file:", err)
+		return err
+	}
+
+	// 6. Atomically update a CHECKPOINT file which records the last segment file path.
+	err = kv.updateCheckpointFile(segmentFilePath)
+	if err != nil {
+		log.Println("Error updating checkpoint file:", err)
+		return err
+	}
+
+	// 7. Remove all old WAL files. This process can be done in the background without holding back the main thread.
+	err = kv.cleanUpWALFiles(segmentID)
+	if err != nil {
+		log.Println("Error cleaning up WAL files:", err)
+		return err
+	}
+
+	// TODO: 8. Remove all old checkpoints via compaction.
 	return nil
 }
 
@@ -545,7 +592,7 @@ func getWalFileNameFromSegmentID(segmentId uint64) string {
 }
 
 // recoverFromWALs recovers the WAL files and returns the WAL object.
-func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState) (*WAL, error) {
+func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState, checkpointSize int64) (*WAL, error) {
 	// Create the WAL directory if it doesn't exist.
 	err := os.MkdirAll(walDir, 0755)
 	if err != nil {
@@ -571,7 +618,7 @@ func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState) (*
 		wal.activeFile = walFile
 		wal.activeSegmentID = lastSegmentID + 1
 		wal.dir = walDir
-		wal.segmentSize = CheckpointSize
+		wal.segmentSize = checkpointSize
 		wal.lastSequenceNum = 0
 		return wal, nil
 	}
@@ -611,7 +658,7 @@ func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState) (*
 					activeFile:      walFile,
 					activeSegmentID: segmentID,
 					dir:             walDir,
-					segmentSize:     CheckpointSize,
+					segmentSize:     checkpointSize,
 					lastSequenceNum: lastSequenceNum,
 				}
 			}
@@ -621,24 +668,26 @@ func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState) (*
 }
 
 // recoverFromSparseIndexFile recovers the sparse index from the sparse index file.
-func recoverFromSparseIndexFile(filePath string, memState *MemState) error {
+// It returns the last good offset and an error.
+func recoverFromSparseIndexFile(filePath string, memState *MemState) (int64, error) {
 	segmentID, err := GetSegmentIDFromIndexFilePath(filePath)
 	if err != nil {
 		log.Println("recoverFromSparseIndexFile: Error getting segment ID from index file:", err)
-		return err
+		return 0, err
 	}
 	sparseIndexFile, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
 	if err != nil {
 		log.Println("recoverFromSparseIndexFile: Error opening sparse index file:", err)
-		return err
+		return 0, err
 	}
 	defer sparseIndexFile.Close()
+	var offset int64 = 0
 	sparseIndexFile.Seek(0, io.SeekStart)
 	for {
-		_, err := sparseIndexFile.Seek(0, io.SeekCurrent)
+		offset, err = sparseIndexFile.Seek(0, io.SeekCurrent)
 		if err != nil {
 			log.Println("recoverFromSparseIndexFile: Error seeking:", err)
-			return err
+			return 0, err
 		}
 		record, err := getNextSparseIndexRecord(sparseIndexFile)
 		if err != nil {
@@ -647,17 +696,18 @@ func recoverFromSparseIndexFile(filePath string, memState *MemState) error {
 				break
 			}
 			log.Println("recoverFromSparseIndexFile: Error getting next sparse index record:", err)
-			return err
+			// Return a special error to indicate that the checkpoint file is corrupted.
+			return offset, lib.ErrSparseIndexCorrupted
 		}
 		if record == nil {
 			log.Println("recoverFromSparseIndexFile: End of file reached")
 			break
 		}
-		log.Println("recoverFromSparseIndexFile: Adding sparse index entry:", record.Key, record.Offset)
+		log.Printf("recoverFromSparseIndexFile: Adding sparse index entry: %s, %d\n", string(record.Key), record.Offset)
 		// Add the entry to the sparse index in memory.
 		memState.AddSparseIndexEntry(segmentID, record.Key, record.Offset)
 	}
-	return nil
+	return offset, nil
 }
 
 // recoverFromWALFile processes a WAL file and returns the last sequence number.
@@ -782,6 +832,38 @@ func (kv *KVStore) Print() {
 	kv.memState.Print()
 }
 
+// tryRecoverSparseIndex tries to recover the sparse index from the checkpoint file. Returns the last segment ID.
+func tryRecoverSparseIndex(dir string, memState *MemState) (uint64, error) {
+	// Read the checkpoint if exists.
+	lastCheckpointFilePath := tryGetLastCheckpoint(filepath.Join(dir, checkpointDir), filepath.Join(dir, logsDir))
+	lastSegmentID := uint64(0)
+
+	if lastCheckpointFilePath != "" {
+		log.Println("tryRecoverSparseIndex: Last checkpoint found:", lastCheckpointFilePath)
+		checkpointFileName := filepath.Base(lastCheckpointFilePath)
+		segmentID, err := getSegmentIDFromSegmentFileName(checkpointFileName)
+		if err != nil {
+			log.Println("tryRecoverSparseIndex: Error getting segment ID from last checkpoint file:", err)
+			return 0, lib.ErrCheckpointCorrupted
+		}
+		lastSegmentID = segmentID
+		log.Println("tryRecoverSparseIndex: Last segment ID:", lastSegmentID)
+
+		// Recover sparse index from sparse index file.
+		sparseIndexFilePath := filepath.Join(dir, checkpointDir, getSparseIndexFileNameFromSegmentId(segmentID))
+		offset, err := recoverFromSparseIndexFile(sparseIndexFilePath, memState)
+		if err != nil {
+			log.Println("tryRecoverSparseIndex: Error recovering from sparse index file:", err)
+			if err == lib.ErrSparseIndexCorrupted {
+				// Truncate the sparse index file to the last good offset.
+				os.Truncate(sparseIndexFilePath, offset)
+			}
+			return lastSegmentID, err
+		}
+	}
+	return lastSegmentID, nil
+}
+
 // Open opens/creates the log file and initializes the KVStore object.
 // 1. Try to get the last checkpoint file path from the checkpoint file and the WAL files.
 //
@@ -802,45 +884,30 @@ func (kv *KVStore) Print() {
 // 1. Add a compaction job that removes old checkpoints and sparse index files.
 // 2. Delete API
 // 3. Recovery sparse index
-func Open(dir string) (*KVStore, error) {
+func Open(config *Configuration) (*KVStore, error) {
 	// Create the master directory if it doesn't exist.
-	err := os.MkdirAll(dir, 0755)
+	err := os.MkdirAll(config.GetBaseDir(), 0755)
 	if err != nil {
 		log.Fatalf("Error creating master directory: %v", err)
 	}
 
 	// Read the checkpoint if exists.
-	lastCheckpointFilePath := tryGetLastCheckpoint(filepath.Join(dir, checkpointDir), filepath.Join(dir, logsDir))
 	lastSegmentID := uint64(0)
 
 	memState := NewMemState()
-
-	if lastCheckpointFilePath != "" {
-		log.Println("Open: Last checkpoint found:", lastCheckpointFilePath)
-		checkpointFileName := filepath.Base(lastCheckpointFilePath)
-		segmentID, err := getSegmentIDFromSegmentFileName(checkpointFileName)
+	lastSegmentID, err = tryRecoverSparseIndex(config.GetBaseDir(), memState)
+	if err != nil {
+		// Try to recover from the segment file.
+		memState, err = tryRecoverFromCheckpoint(filepath.Join(config.GetBaseDir(), checkpointDir, getSegmentFileNameFromSegmentId(lastSegmentID)))
 		if err != nil {
-			log.Println("Open: Error getting segment ID from last checkpoint file:", err)
+			log.Println("Open: Error recovering from checkpoint:", err)
 			return nil, lib.ErrCheckpointCorrupted
 		}
-		lastSegmentID = segmentID
-		// // Recover memstate from checkpoint file.
-		// memState, err = recoverFromCheckpoint(lastCheckpointFilePath)
-		// if err != nil {
-		// 	log.Println("Error recovering from checkpoint:", err)
-		// 	return nil, ErrCheckpointCorrupted
-		// }
-
-		// Recover sparse index from sparse index file.
-		err = recoverFromSparseIndexFile(filepath.Join(dir, checkpointDir, getSparseIndexFileNameFromSegmentId(segmentID)), memState)
-		if err != nil {
-			log.Println("Open: Error recovering from sparse index file:", err)
-			return nil, lib.ErrCheckpointCorrupted
-		}
+		log.Println("Open: Recovered from segment:", lastSegmentID)
 	}
 
 	// Recover from WAL files.
-	wal, err := recoverFromWALs(lastSegmentID, filepath.Join(dir, logsDir), memState)
+	wal, err := recoverFromWALs(lastSegmentID, filepath.Join(config.GetBaseDir(), logsDir), memState, config.GetCheckpointSize())
 	if err != nil {
 		log.Println("Open: Error recovering from WAL files:", err)
 		return nil, err
@@ -850,6 +917,6 @@ func Open(dir string) (*KVStore, error) {
 	return &KVStore{
 		wal:      wal,
 		memState: memState,
-		dir:      dir,
+		dir:      config.GetBaseDir(),
 	}, nil
 }

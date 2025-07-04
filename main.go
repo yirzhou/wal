@@ -4,18 +4,25 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"wal/db"
 )
 
 func main() {
 	args := os.Args[1:]
-	if len(args) == 0 {
+	if len(args) < 2 {
 		fmt.Println("Please specify the root directory for WAL and checkpoints.")
 		return
 	}
-	walDir := args[0]
+	dbDir := args[0]
+	checkpointSize, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		fmt.Println("Please specify the checkpoint size as an integer.")
+		return
+	}
 
-	kv, err := db.Open(walDir)
+	dbConfig := db.NewDefaultConfiguration().WithBaseDir(dbDir).WithCheckpointSize(checkpointSize)
+	kv, err := db.Open(dbConfig)
 	if err != nil {
 		log.Println("Error creating KVStore:", err)
 		return
