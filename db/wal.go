@@ -2,11 +2,9 @@ package db
 
 import (
 	"encoding/binary"
-	"errors"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"wal/lib"
 )
@@ -28,9 +26,6 @@ type WAL struct {
 
 	// The file handle for the current, active segment we are writing to.
 	activeFile *os.File
-
-	// The ID of the active segment (e.g., 1 for wal-0001).
-	activeSegmentID uint64
 
 	// The max size for each segment file before we roll to a new one.
 	segmentSize int64
@@ -106,67 +101,9 @@ func (l *WAL) Append(key, value []byte) error {
 	if fileInfo.Size() >= l.segmentSize {
 		// Special error to signal that the log has reached its size threshold.
 		// This is used to trigger a checkpoint.
-		log.Println("WAL is ready to be checkpointed; segment ID:", l.GetCurrentSegmentID())
+		log.Println("WAL is ready to be checkpointed")
 		return lib.ErrCheckpointNeeded
 	}
-	return nil
-}
-
-// GetCurrentSegmentID returns the ID of the current segment.
-func (l *WAL) GetCurrentSegmentID() uint64 {
-	return l.activeSegmentID
-}
-
-func (l *WAL) GetLastSegmentID() uint64 {
-	if l.activeSegmentID == 1 {
-		log.Panicln("No segments have been written yet -- this function should not have been called.")
-		return 0
-	}
-	return l.activeSegmentID - 1
-}
-
-// GetLastSegmentID returns the ID of the last segment.
-// It panics if no segments have been written yet.
-func (l *WAL) GetLastSegmentFile() (*os.File, error) {
-	lastSegmentID := l.GetLastSegmentID()
-	if lastSegmentID == 0 {
-		log.Panicln("No segments have been written yet -- this function should not have been called.")
-		return nil, errors.New("no segments have been written yet")
-	}
-
-	lastSegmentFileName := getWalFileNameFromSegmentID(lastSegmentID)
-	lastSegmentFilePath := filepath.Join(l.dir, lastSegmentFileName)
-	lastSegmentFile, err := os.OpenFile(lastSegmentFilePath, os.O_RDONLY, 0644)
-	if err != nil {
-		log.Println("Error opening last segment file:", err)
-		return nil, err
-	}
-	return lastSegmentFile, nil
-}
-
-// RollToNewSegment rolls to a new segment.
-func (l *WAL) RollToNewSegment() error {
-	// 1. Close the current segment.
-	err := l.activeFile.Close()
-	if err != nil {
-		return err
-	}
-	// 2. Open a new segment file.
-	newSegmentID := l.activeSegmentID + 1
-	newSegmentFileName := getWalFileNameFromSegmentID(newSegmentID)
-	newSegmentFilePath := filepath.Join(l.dir, newSegmentFileName)
-	newSegmentFile, err := os.OpenFile(newSegmentFilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-
-	// 3. Update the active file and segment ID.
-	l.activeFile = newSegmentFile
-	l.activeSegmentID = newSegmentID
-
-	log.Println("rollToNewSegment: Rolled to new segment:", newSegmentID)
-
-	// 4. Return nil.
 	return nil
 }
 

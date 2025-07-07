@@ -36,10 +36,86 @@ type Pair struct {
 }
 
 type KVStore struct {
-	lock     sync.RWMutex
-	wal      *WAL
-	memState *MemState
-	dir      string
+	lock            sync.RWMutex
+	wal             *WAL
+	memState        *MemState
+	activeSegmentID uint64
+	dir             string
+	// Outer slice index is the level number.
+	// Inner slice holds all the segment files for that level.
+	levels [][]SegmentMetadata
+}
+
+// Open opens/creates the log file and initializes the KVStore object.
+//
+// 1. Try to get the last checkpoint file path from the checkpoint file and the WAL files.
+//
+// 2. If the checkpoint is found, open it and read the last segment file path.
+//
+// - Load the segment file into memtable.
+//
+// - For all WAL files with segment ID greater than the last segment ID in the checkpoint file, replay them into memtable in ascending order.
+//
+// - Truncate the WAL file (likely the last one) to the last good offset.
+//
+// 3. If the checkpoint is not found, simply start from the beginning of the WAL files and replay them into memtable in ascending order.
+//
+// - Truncate the WAL file (likely the last one) to the last good offset.
+//
+// 4. Create and return the KVStore object.
+// TODOs:
+// 1. Add a compaction job that removes old checkpoints and sparse index files.
+func Open(config *Configuration) (*KVStore, error) {
+	// Create the master directory if it doesn't exist.
+	err := os.MkdirAll(config.GetBaseDir(), 0755)
+	if err != nil {
+		log.Fatalf("Error creating master directory: %v", err)
+	}
+
+	// Read the checkpoint if exists.
+	lastSegmentID := uint64(0)
+
+	memState := NewMemState()
+	lastSegmentID, err = tryRecoverSparseIndex(config.GetBaseDir(), memState)
+	if err != nil {
+		// Try to recover from the segment file.
+		memState, err = tryRecoverFromCheckpoint(filepath.Join(config.GetBaseDir(), checkpointDir, getSegmentFileNameFromSegmentId(lastSegmentID)))
+		if err != nil {
+			log.Println("Open: Error recovering from checkpoint:", err)
+			return nil, lib.ErrCheckpointCorrupted
+		}
+		log.Println("Open: Recovered from segment:", lastSegmentID)
+	}
+
+	// Recover from WAL files.
+	wal, err := recoverFromWALs(lastSegmentID, filepath.Join(config.GetBaseDir(), logsDir), memState, config.GetCheckpointSize())
+	if err != nil {
+		log.Println("Open: Error recovering from WAL files:", err)
+		return nil, err
+	}
+
+	// Return the fully initialized, ready-to-use KVStore object.
+	return &KVStore{
+		wal:             wal,
+		memState:        memState,
+		activeSegmentID: lastSegmentID + 1,
+		dir:             config.GetBaseDir(),
+		levels:          make([][]SegmentMetadata, 0),
+	}, nil
+}
+
+// GetCurrentSegmentID returns the ID of the current segment.
+func (s *KVStore) GetCurrentSegmentID() uint64 {
+	return s.activeSegmentID
+}
+
+// GetLastSegmentID returns the ID of the last segment.
+func (s *KVStore) GetLastSegmentID() uint64 {
+	if s.activeSegmentID == 1 {
+		log.Panicln("No segments have been written yet -- this function should not have been called.")
+		return 0
+	}
+	return s.activeSegmentID - 1
 }
 
 // Get returns the value for a given key. The value is nil if the key is not found.
@@ -475,6 +551,34 @@ func (kv *KVStore) getSparseIndexFilePath(segmentID uint64) string {
 	return filepath.Join(kv.dir, checkpointDir, sparseIndexFileName)
 }
 
+// RollToNewSegment rolls to a new segment.
+// It creates a new WAL file and updates the WAL object.
+// It also updates the current segment ID and the last sequence number.
+func (kv *KVStore) RollToNewSegment() error {
+	segmentID := kv.GetCurrentSegmentID() + 1
+	walFileName := getWalFileNameFromSegmentID(segmentID)
+	walFilePath := filepath.Join(kv.dir, logsDir, walFileName)
+	walFile, err := os.OpenFile(walFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Println("Error opening WAL file:", err)
+		return err
+	}
+	// Close the current file
+	err = kv.wal.activeFile.Close()
+	if err != nil {
+		log.Println("Error closing current WAL file:", err)
+		return err
+	}
+	kv.wal.activeFile = walFile
+	// kv.wal.activeSegmentID = segmentID
+	kv.wal.lastSequenceNum = 0
+
+	// Update the active segment ID.
+	kv.activeSegmentID = segmentID
+
+	return nil
+}
+
 // doCheckpoint is the main function that performs a checkpoint.
 // It creates a new segment file, converts the memtable to an SSTable,
 // and writes the SSTable to the segment file.
@@ -491,10 +595,10 @@ func (kv *KVStore) doCheckpoint() error {
 		return err
 	}
 
-	segmentID := kv.wal.GetCurrentSegmentID()
+	segmentID := kv.GetCurrentSegmentID()
 
 	// 2. Roll to a new segment.
-	err = kv.wal.RollToNewSegment()
+	err = kv.RollToNewSegment()
 	if err != nil {
 		log.Println("Error rolling to a new segment:", err)
 		return err
@@ -616,7 +720,6 @@ func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState, ch
 			return nil, err
 		}
 		wal.activeFile = walFile
-		wal.activeSegmentID = lastSegmentID + 1
 		wal.dir = walDir
 		wal.segmentSize = checkpointSize
 		wal.lastSequenceNum = 0
@@ -656,7 +759,6 @@ func recoverFromWALs(lastSegmentID uint64, walDir string, memState *MemState, ch
 				// Construct the WAL
 				wal = &WAL{
 					activeFile:      walFile,
-					activeSegmentID: segmentID,
 					dir:             walDir,
 					segmentSize:     checkpointSize,
 					lastSequenceNum: lastSequenceNum,
@@ -862,61 +964,4 @@ func tryRecoverSparseIndex(dir string, memState *MemState) (uint64, error) {
 		}
 	}
 	return lastSegmentID, nil
-}
-
-// Open opens/creates the log file and initializes the KVStore object.
-// 1. Try to get the last checkpoint file path from the checkpoint file and the WAL files.
-//
-// 2. If the checkpoint is found, open it and read the last segment file path.
-//
-// - Load the segment file into memtable.
-//
-// - For all WAL files with segment ID greater than the last segment ID in the checkpoint file, replay them into memtable in ascending order.
-//
-// - Truncate the WAL file (likely the last one) to the last good offset.
-//
-// 3. If the checkpoint is not found, simply start from the beginning of the WAL files and replay them into memtable in ascending order.
-//
-// - Truncate the WAL file (likely the last one) to the last good offset.
-//
-// 4. Create and return the KVStore object.
-// TODOs:
-// 1. Add a compaction job that removes old checkpoints and sparse index files.
-// 2. Delete API
-// 3. Recovery sparse index
-func Open(config *Configuration) (*KVStore, error) {
-	// Create the master directory if it doesn't exist.
-	err := os.MkdirAll(config.GetBaseDir(), 0755)
-	if err != nil {
-		log.Fatalf("Error creating master directory: %v", err)
-	}
-
-	// Read the checkpoint if exists.
-	lastSegmentID := uint64(0)
-
-	memState := NewMemState()
-	lastSegmentID, err = tryRecoverSparseIndex(config.GetBaseDir(), memState)
-	if err != nil {
-		// Try to recover from the segment file.
-		memState, err = tryRecoverFromCheckpoint(filepath.Join(config.GetBaseDir(), checkpointDir, getSegmentFileNameFromSegmentId(lastSegmentID)))
-		if err != nil {
-			log.Println("Open: Error recovering from checkpoint:", err)
-			return nil, lib.ErrCheckpointCorrupted
-		}
-		log.Println("Open: Recovered from segment:", lastSegmentID)
-	}
-
-	// Recover from WAL files.
-	wal, err := recoverFromWALs(lastSegmentID, filepath.Join(config.GetBaseDir(), logsDir), memState, config.GetCheckpointSize())
-	if err != nil {
-		log.Println("Open: Error recovering from WAL files:", err)
-		return nil, err
-	}
-
-	// Return the fully initialized, ready-to-use KVStore object.
-	return &KVStore{
-		wal:      wal,
-		memState: memState,
-		dir:      config.GetBaseDir(),
-	}, nil
 }
