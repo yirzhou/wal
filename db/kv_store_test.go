@@ -67,7 +67,6 @@ func TestPutGet(t *testing.T) {
 func TestRecoveryNormal(t *testing.T) {
 	dir := getTestDir()
 	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
-	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
 	}

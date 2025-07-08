@@ -36,6 +36,15 @@ type sparseIndex []sparseIndexEntry
 
 type sparseIndexes map[uint64]sparseIndex
 
+// GetSparseIndex returns the sparse index for a given segment ID.
+func (m *MemState) GetSparseIndex(segmentID uint64) sparseIndex {
+	res, ok := m.sparseIndexMap[segmentID]
+	if !ok {
+		return make(sparseIndex, 0)
+	}
+	return res
+}
+
 // AddSparseIndexEntry adds a new entry to the sparse index.
 func (m *MemState) AddSparseIndexEntry(segmentID uint64, key []byte, offset int64) {
 	if m.sparseIndexMap[segmentID] == nil {
@@ -168,23 +177,23 @@ func (m *MemState) FlushSparseIndex(filePath string) error {
 // Flush flushes the memtable to the segment file.
 // It writes the entries to the segment file in sorted order.
 // TODO: It also updates the offset in the sparse index.
-func (m *MemState) Flush(filePath string) error {
+func (m *MemState) Flush(filePath string) ([]byte, []byte, error) {
 	segmentID, err := GetSegmentIDFromSegmentFilePath(filePath)
 	if err != nil {
 		log.Println("Error getting segment ID from segment file path:", err)
-		return err
+		return nil, nil, err
 	}
 	segmentFile, err := m.createNewSegmentFile(filePath)
 	if err != nil {
 		log.Println("Error creating segment file:", err)
-		return err
+		return nil, nil, err
 	}
 	defer segmentFile.Close()
 	// Seek to the beginning of the file (offset 0)
 	_, err = segmentFile.Seek(0, io.SeekStart)
 	if err != nil {
 		log.Println("Error seeking to start:", err)
-		return err
+		return nil, nil, err
 	}
 	entries := m.GetAllSortedPairs()
 	offset := int64(0)
@@ -193,7 +202,7 @@ func (m *MemState) Flush(filePath string) error {
 		_, err := segmentFile.Write(bytes)
 		if err != nil {
 			log.Println("Error writing to segment file:", err)
-			return err
+			return nil, nil, err
 		}
 		// Update the sparse index every 2 records.
 		if idx%2 == 0 {
@@ -210,10 +219,12 @@ func (m *MemState) Flush(filePath string) error {
 	err = segmentFile.Sync()
 	if err != nil {
 		log.Println("Error flushing to segment file:", err)
-		return err
+		return nil, nil, err
 	}
-
-	return nil
+	// Return the min and max key
+	minKey := []byte(entries[0].Key)
+	maxKey := []byte(entries[len(entries)-1].Key)
+	return minKey, maxKey, nil
 }
 
 // getNextSparseIndexRecord reads the next sparse index record from the file.
