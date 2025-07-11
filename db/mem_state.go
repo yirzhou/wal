@@ -45,6 +45,14 @@ func (m *MemState) GetSparseIndex(segmentID uint64) sparseIndex {
 	return res
 }
 
+func (m *MemState) RemoveSparseIndexEntry(segmentID uint64) {
+	delete(m.sparseIndexMap, segmentID)
+}
+
+func (m *MemState) AddSparseIndexEntriesBulk(segmentID uint64, sparseIndexEntries []sparseIndexEntry) {
+	m.sparseIndexMap[segmentID] = sparseIndexEntries
+}
+
 // AddSparseIndexEntry adds a new entry to the sparse index.
 func (m *MemState) AddSparseIndexEntry(segmentID uint64, key []byte, offset int64) {
 	if m.sparseIndexMap[segmentID] == nil {

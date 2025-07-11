@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log"
 	"os"
@@ -14,11 +15,28 @@ type SegmentMetadata struct {
 	minKey   []byte
 	maxKey   []byte
 	filePath string
+	// Usually not used, only used in compaction to pass newly constructed sparse indexes back to the main KVStore.
+	sparseIndex sparseIndex
 }
 
 // GetSparseIndexFileName returns the file name of the sparse index file for the segment.
 func (s *SegmentMetadata) GetSparseIndexFileName() string {
 	return getSparseIndexFileNameFromSegmentId(s.id)
+}
+
+// HasOverlappingKeys checks if the two segments have overlapping keys.
+func (s *SegmentMetadata) HasOverlappingKeys(other *SegmentMetadata) bool {
+	// Assert that the min and max keys of the two segments are not nil
+	if s.minKey == nil || s.maxKey == nil || other.minKey == nil || other.maxKey == nil {
+		log.Fatalln("HasOverlappingKeys: Min or max key is nil")
+	}
+	if bytes.Compare(s.maxKey, other.minKey) <= 0 {
+		return false
+	}
+	if bytes.Compare(other.maxKey, s.minKey) <= 0 {
+		return false
+	}
+	return true
 }
 
 // ReadSegmentMetadata reads the segment metadata from the file.

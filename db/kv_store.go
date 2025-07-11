@@ -18,14 +18,16 @@ import (
 )
 
 const (
-	checkpointDir         = "checkpoints"
-	logsDir               = "logs"
-	checkpointFile        = "CHECKPOINT"
-	currentFile           = "CURRENT"
-	walFilePrefix         = "wal-"
-	segmentFilePrefix     = "segment-"
-	manifestFilePrefix    = "manifest-"
-	sparseIndexFilePrefix = "index-"
+	checkpointDir              = "checkpoints"
+	logsDir                    = "logs"
+	checkpointFile             = "CHECKPOINT"
+	currentFile                = "CURRENT"
+	walFilePrefix              = "wal-"
+	segmentFilePrefix          = "segment-"
+	manifestFilePrefix         = "manifest-"
+	sparseIndexFilePrefix      = "index-"
+	segmentThresholdL0         = 4
+	segmentFileSizeThresholdLX = 10 * 1024 * 1024 // 10MiB
 )
 
 // Write to WAL -> Update Memtable -> (When ready) -> Flush Memtable to SSTable -> Checkpoint -> Delete old WAL
@@ -228,16 +230,27 @@ func Open(config *Configuration) (*KVStore, error) {
 
 // GetCurrentSegmentID returns the ID of the current segment.
 func (s *KVStore) GetCurrentSegmentID() uint64 {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
 	return s.activeSegmentID
 }
 
 // GetLastSegmentID returns the ID of the last segment.
 func (s *KVStore) GetLastSegmentID() uint64 {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
 	if s.activeSegmentID == 1 {
 		log.Panicln("No segments have been written yet -- this function should not have been called.")
 		return 0
 	}
 	return s.activeSegmentID - 1
+}
+
+func (s *KVStore) AllocateNewSegmentID() uint64 {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.activeSegmentID++
+	return s.activeSegmentID
 }
 
 // Get returns the value for a given key. The value is nil if the key is not found.
@@ -379,6 +392,32 @@ func (kv *KVStore) getManifestFilePath(segmentID uint64) string {
 }
 
 // flushManifestFile flushes the manifest file for a given segment ID.
+func flushManifestFileWithLevels(filePath string, levels [][]SegmentMetadata) error {
+	file, err := os.OpenFile(filePath, AppendFlags, 0644)
+	if err != nil {
+		log.Println("flushManifestFileWithLevels: Error opening manifest file:", err)
+		return err
+	}
+	defer file.Close()
+	for _, level := range levels {
+		for _, segment := range level {
+			bytes := segment.GetBytes()
+			_, err = file.Write(bytes)
+			if err != nil {
+				log.Println("flushManifestFileWithLevels: Error writing to manifest file:", err)
+				return err
+			}
+			err = file.Sync() // Sync after each segment.
+			if err != nil {
+				log.Println("flushManifestFileWithLevels: Error syncing manifest file:", err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// flushManifestFile flushes the manifest file for a given segment ID.
 func (kv *KVStore) flushManifestFile(segmentID uint64) (string, error) {
 	manifestFilePath := kv.getManifestFilePath(segmentID)
 	manifestFile, err := os.OpenFile(manifestFilePath, os.O_CREATE|os.O_RDWR, 0644)
@@ -397,9 +436,13 @@ func (kv *KVStore) flushManifestFile(segmentID uint64) (string, error) {
 				log.Println("Error writing to manifest file:", err)
 				return "", err
 			}
+			err = manifestFile.Sync() // Sync after each segment.
+			if err != nil {
+				log.Println("Error syncing manifest file:", err)
+				return "", err
+			}
 		}
 	}
-	manifestFile.Sync()
 	return manifestFilePath, nil
 }
 
@@ -729,11 +772,6 @@ func (kv *KVStore) RollToNewSegment() error {
 	kv.activeSegmentID = segmentID
 
 	return nil
-}
-
-func (kv *KVStore) doCompaction() error {
-	// Check L0's overall size.
-
 }
 
 // doCheckpoint is the main function that performs a checkpoint.
