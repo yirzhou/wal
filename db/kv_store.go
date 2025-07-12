@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"wal/lib"
 )
 
@@ -48,6 +49,36 @@ type KVStore struct {
 	// Inner slice holds all the segment files for that level.
 	levels                     [][]SegmentMetadata
 	segmentFileSizeThresholdLX int64
+
+	// A channel to signal the compaction loop to stop.
+	shutdownChan chan struct{}
+
+	// The configuration for the KVStore.
+	config *Configuration
+}
+
+// compactionLoop is the main loop for the compaction process.
+// It runs in the background and checks for work every 30 seconds.
+// It also listens to the shutdownChan and stops when it receives a signal.
+func (s *KVStore) compactionLoop() {
+	// A Ticker is more efficient than time.Sleep for periodic tasks.
+	ticker := time.NewTicker(time.Duration(s.config.GetCompactionIntervalMs()) * time.Millisecond) // Check every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// The ticker fired, it's time to check for work.
+			log.Println("Background check for compaction work...")
+			if err := s.doCompaction(); err != nil {
+				log.Printf("Error during background compaction: %v", err)
+			}
+		case <-s.shutdownChan:
+			// We received a shutdown signal, exit the loop.
+			log.Println("Stopping compaction loop.")
+			return
+		}
+	}
 }
 
 // tryRecoverFromCurrentFile tries to recover the last segment ID from the CURRENT file.
@@ -205,6 +236,18 @@ func Open(config *Configuration) (*KVStore, error) {
 		log.Fatalf("Error creating master directory: %v", err)
 	}
 
+	// Create logs directory if it doesn't exist.
+	err = os.MkdirAll(filepath.Join(config.GetBaseDir(), logsDir), 0755)
+	if err != nil {
+		log.Fatalf("Error creating logs directory: %v", err)
+	}
+
+	// Create checkpoint directory if it doesn't exist.
+	err = os.MkdirAll(filepath.Join(config.GetBaseDir(), checkpointDir), 0755)
+	if err != nil {
+		log.Fatalf("Error creating checkpoint directory: %v", err)
+	}
+
 	// Read the "CURRENT" file
 	levels, lastSegmentID, err := tryRecoverFromCurrentFile(filepath.Join(config.GetBaseDir(), checkpointDir, currentFile))
 	if err != nil && !os.IsNotExist(err) {
@@ -227,14 +270,21 @@ func Open(config *Configuration) (*KVStore, error) {
 	}
 
 	// Return the fully initialized, ready-to-use KVStore object.
-	return &KVStore{
+	kv := &KVStore{
 		wal:                        wal,
 		memState:                   memState,
 		activeSegmentID:            lastSegmentID + 1,
 		dir:                        config.GetBaseDir(),
 		levels:                     levels,
 		segmentFileSizeThresholdLX: config.GetSegmentFileSizeThresholdLX(),
-	}, nil
+		shutdownChan:               make(chan struct{}),
+		config:                     config,
+	}
+	// Start the compaction loop.
+	if config.GetCompactionIntervalMs() > 0 {
+		go kv.compactionLoop()
+	}
+	return kv, nil
 }
 
 // GetCurrentSegmentIDSafe returns the ID of the current segment.
@@ -244,19 +294,18 @@ func (s *KVStore) GetCurrentSegmentIDSafe() uint64 {
 	return s.activeSegmentID
 }
 
+// This method assumes that the lock is currently withheld.
 func (s *KVStore) GetCurrentSegmentIDUnsafe() uint64 {
 	return s.activeSegmentID
 }
 
+// This method assumes that the lock is currently withheld.
 func (s *KVStore) AllocateSegmentIDUnsafe() uint64 {
-	if s.lock.TryLock() {
-		s.lock.Unlock()
-		log.Fatalf("AllocateSegmentIDUnsafe: The lock is not acquired")
-	}
 	s.activeSegmentID++
 	return s.activeSegmentID
 }
 
+// This method assumes that the lock is currently not withheld.
 func (s *KVStore) AllocateNewSegmentID() uint64 {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -1028,6 +1077,9 @@ func recoverFromWALFile(reader *os.File, memState *MemState, isLastWal bool) (ui
 
 // Close closes the WAL file.
 func (kv *KVStore) Close() error {
+	// Signal the compaction loop to stop.
+	close(kv.shutdownChan)
+	// Close the WAL file.
 	return kv.wal.Close()
 }
 

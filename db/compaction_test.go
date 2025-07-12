@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"wal/lib"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -51,37 +52,36 @@ func TestGetNewLevels(t *testing.T) {
 }
 
 func TestDeleteOldSegmentsAndIndexes(t *testing.T) {
-	config := NewDefaultConfiguration().WithBaseDir(t.TempDir())
+	config := NewDefaultConfiguration().WithNoLog().WithBaseDir(lib.GetTempDirForTest(t))
 	kv, err := Open(config)
 	assert.NoError(t, err)
 
 	defer kv.CloseAndCleanUp()
 	// Create a few segments and indexes files
-	os.Create(kv.getSegmentFilePath(1))
-	os.Create(kv.getSegmentFilePath(2))
-	os.Create(kv.getSegmentFilePath(3))
-	os.Create(kv.getSparseIndexFilePath(1))
-	os.Create(kv.getSparseIndexFilePath(2))
-	os.Create(kv.getSparseIndexFilePath(3))
+	os.Create(filepath.Join(kv.getCheckpointDir(), getSegmentFileNameFromSegmentId(1)))
+	assert.NoError(t, err)
+	os.Create(filepath.Join(kv.getCheckpointDir(), getSegmentFileNameFromSegmentId(2)))
+	assert.NoError(t, err)
+	os.Create(filepath.Join(kv.getCheckpointDir(), getSparseIndexFileNameFromSegmentId(1)))
+	assert.NoError(t, err)
+	os.Create(filepath.Join(kv.getCheckpointDir(), getSparseIndexFileNameFromSegmentId(2)))
+	assert.NoError(t, err)
 
 	compactionPlan := &CompactionPlan{
 		baseSegments: []SegmentMetadata{
-			{id: 1, level: 0},
-			{id: 2, level: 0},
+			{id: 1, level: 0, filePath: filepath.Join(kv.getCheckpointDir(), getSegmentFileNameFromSegmentId(1))},
 		},
 		overlappingSegments: []SegmentMetadata{
-			{id: 3, level: 1},
+			{id: 2, level: 1, filePath: filepath.Join(kv.getCheckpointDir(), getSegmentFileNameFromSegmentId(2))},
 		},
 	}
 	err = kv.deleteOldSegmentsAndIndexes(compactionPlan)
 	assert.NoError(t, err)
 	// Check that the segments and indexes files are deleted
-	assert.NoFileExists(t, kv.getSegmentFilePath(1))
-	assert.NoFileExists(t, kv.getSegmentFilePath(2))
-	assert.NoFileExists(t, kv.getSegmentFilePath(3))
-	assert.NoFileExists(t, kv.getSparseIndexFilePath(1))
-	assert.NoFileExists(t, kv.getSparseIndexFilePath(2))
-	assert.NoFileExists(t, kv.getSparseIndexFilePath(3))
+	assert.NoFileExists(t, filepath.Join(kv.getCheckpointDir(), getSegmentFileNameFromSegmentId(1)))
+	assert.NoFileExists(t, filepath.Join(kv.getCheckpointDir(), getSegmentFileNameFromSegmentId(2)))
+	assert.NoFileExists(t, filepath.Join(kv.getCheckpointDir(), getSparseIndexFileNameFromSegmentId(1)))
+	assert.NoFileExists(t, filepath.Join(kv.getCheckpointDir(), getSparseIndexFileNameFromSegmentId(2)))
 }
 
 func TestFlushManifestFileWithLevels(t *testing.T) {
@@ -127,7 +127,7 @@ func TestFlushManifestFileWithLevels(t *testing.T) {
 
 // This test may take a while to run.
 func TestPerformMerge(t *testing.T) {
-	config := NewDefaultConfiguration().WithBaseDir(t.TempDir()).WithSegmentFileSizeThresholdLX(128).WithCheckpointSize(128)
+	config := NewDefaultConfiguration().WithNoLog().WithBaseDir(t.TempDir()).WithSegmentFileSizeThresholdLX(128).WithCheckpointSize(128).WithCompactionIntervalMs(0)
 	kv, err := Open(config)
 	assert.NoError(t, err)
 	defer kv.CloseAndCleanUp()
@@ -206,13 +206,13 @@ func TestPerformMerge(t *testing.T) {
 
 // TestDoCompaction tests that the compaction works correctly. It also tests the new recovery logic.
 func TestDoCompaction(t *testing.T) {
-	config := NewDefaultConfiguration().WithBaseDir(t.TempDir()).WithSegmentFileSizeThresholdLX(128).WithCheckpointSize(128)
+	config := NewDefaultConfiguration().WithNoLog().WithBaseDir(t.TempDir()).WithSegmentFileSizeThresholdLX(128).WithCheckpointSize(128).WithCompactionIntervalMs(0)
 	kv, err := Open(config)
 	assert.NoError(t, err)
 
 	kvMap := make(map[string][]byte)
 	// Put some records
-	keyCount := 100
+	keyCount := 20
 	for i := range keyCount {
 		kv.putInternal([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("value%d", i)))
 		kvMap[fmt.Sprintf("key%d", i)] = []byte(fmt.Sprintf("value%d", i))

@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -23,15 +22,9 @@ func generateRandomString(length int) string {
 	return string(b)
 }
 
-func getTestDir() string {
-	timestamp := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
-	prefix := "kv-store-test-" + timestamp
-	return filepath.Join("/tmp", prefix)
-}
-
 func TestOpen(t *testing.T) {
-	dir := getTestDir()
-	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, err := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
@@ -39,8 +32,8 @@ func TestOpen(t *testing.T) {
 }
 
 func TestPutGet(t *testing.T) {
-	dir := getTestDir()
-	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, err := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
@@ -65,8 +58,8 @@ func TestPutGet(t *testing.T) {
 }
 
 func TestRecoveryNormal(t *testing.T) {
-	dir := getTestDir()
-	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, err := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
 	}
@@ -82,7 +75,7 @@ func TestRecoveryNormal(t *testing.T) {
 	// Close the KVStore.
 	kv.Close()
 	// Recover the KVStore.
-	kv, err = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	kv, err = Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	if err != nil {
 		t.Fatalf("Error recovering KVStore: %v", err)
 	}
@@ -100,8 +93,8 @@ func TestRecoveryNormal(t *testing.T) {
 }
 
 func TestRecoveryWithCorruptedWALFile(t *testing.T) {
-	dir := getTestDir()
-	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, err := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
 	}
@@ -127,7 +120,7 @@ func TestRecoveryWithCorruptedWALFile(t *testing.T) {
 	// The database should be recovered from all segments and WALs.
 	// The last bit will only corrupt the last record in the WAL file, which is the "key-99" record.
 	// So the key-value pairs from 0 to 98 should be recovered, but the key-value pair for "key-99" should be lost.
-	kv, err = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	kv, err = Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error recovering KVStore: %v", err)
@@ -146,8 +139,8 @@ func TestRecoveryWithCorruptedWALFile(t *testing.T) {
 }
 
 func TestRecoveryWithCorruptedSparseIndexFile(t *testing.T) {
-	dir := getTestDir()
-	kv, _ := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, _ := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 
 	// Put 100 key-value pairs.
 	for i := range 100 {
@@ -165,7 +158,7 @@ func TestRecoveryWithCorruptedSparseIndexFile(t *testing.T) {
 	os.Truncate(sparseIndexFilePath, stat.Size()-1)
 
 	// The database should be recovered from all segments and WALs.
-	kv, _ = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	kv, _ = Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 
 	// Check if the key-value pairs are recovered.
@@ -177,8 +170,8 @@ func TestRecoveryWithCorruptedSparseIndexFile(t *testing.T) {
 }
 
 func TestRecoveryWithCorruptedCheckpoint(t *testing.T) {
-	dir := getTestDir()
-	kv, err := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, err := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	if err != nil {
 		t.Fatalf("Error creating KVStore: %v", err)
 	}
@@ -196,7 +189,7 @@ func TestRecoveryWithCorruptedCheckpoint(t *testing.T) {
 	os.Truncate(checkpointFilePath, 0)
 
 	// The database should be recovered from all segments and WALs.
-	kv, err = Open(NewDefaultConfiguration().WithBaseDir(dir))
+	kv, err = Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 	if err != nil {
 		t.Fatalf("Error recovering KVStore: %v", err)
@@ -213,8 +206,8 @@ func TestRecoveryWithCorruptedCheckpoint(t *testing.T) {
 func TestRecoveryNormalWithVariousCheckpointSizes(t *testing.T) {
 	checkpointSize := 1024
 	for checkpointSize <= 1024*1024 {
-		dir := getTestDir()
-		kv, _ := Open(NewDefaultConfiguration().WithBaseDir(dir).WithCheckpointSize(int64(checkpointSize)))
+		dir := t.TempDir()
+		kv, _ := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir).WithCheckpointSize(int64(checkpointSize)))
 
 		// Put 100 key-value pairs.
 		for i := range 100 {
@@ -225,7 +218,7 @@ func TestRecoveryNormalWithVariousCheckpointSizes(t *testing.T) {
 		kv.Close()
 
 		// Recover the DB
-		kv, _ = Open(NewDefaultConfiguration().WithBaseDir(dir).WithCheckpointSize(int64(checkpointSize)))
+		kv, _ = Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir).WithCheckpointSize(int64(checkpointSize)))
 		defer kv.CloseAndCleanUp()
 
 		// Check if the key-value pairs are recovered.
@@ -239,8 +232,8 @@ func TestRecoveryNormalWithVariousCheckpointSizes(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	dir := getTestDir()
-	kv, _ := Open(NewDefaultConfiguration().WithBaseDir(dir))
+	dir := t.TempDir()
+	kv, _ := Open(NewDefaultConfiguration().WithNoLog().WithBaseDir(dir))
 	defer kv.CloseAndCleanUp()
 
 	// Put 100 key-value pairs.
