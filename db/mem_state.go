@@ -151,37 +151,6 @@ func (m *MemState) GetAllSegmentIDsDescendingOrder() ([]uint64, error) {
 	return segmentIDs, nil
 }
 
-// FlushSparseIndex flushes the sparse index to the sparse index file.
-func (m *MemState) FlushSparseIndex(filePath string) error {
-	segmentID, err := GetSegmentIDFromIndexFilePath(filePath)
-	if err != nil {
-		log.Println("Error getting segment ID from segment file path:", err)
-		return err
-	}
-	sparseIndexFile, err := os.OpenFile(filePath, AppendFlags, 0644)
-	if err != nil {
-		log.Println("Error creating sparse index file:", err)
-		return err
-	}
-	defer sparseIndexFile.Close()
-	sparseIndexFile.Seek(0, io.SeekStart)
-	for _, entry := range m.sparseIndexMap[segmentID] {
-		sparseIndexFile.Seek(0, io.SeekCurrent)
-		_, err := sparseIndexFile.Write(GetSparseIndexBytes(segmentID, entry.key, entry.offset))
-		if err != nil {
-			log.Println("FlushSparseIndex: Error writing to sparse index file:", err)
-			return err
-		}
-	}
-	err = sparseIndexFile.Sync()
-	if err != nil {
-		log.Println("FlushSparseIndex: Error syncing sparse index file:", err)
-		return err
-	}
-	log.Println("FlushSparseIndex: Successfully flushed sparse index to file:", filePath)
-	return nil
-}
-
 // Flush flushes the memtable to the segment file.
 // It writes the entries to the segment file in sorted order.
 // TODO: It also updates the offset in the sparse index.
@@ -264,7 +233,7 @@ func getNextSparseIndexRecord(file *os.File) (*SparseIndexRecord, error) {
 	// Check the checksum.
 	computedChecksum := ComputeChecksum(fullBytes)
 	if computedChecksum != record.Checksum {
-		log.Printf("getNextSparseIndexRecord:Error computing checksum: %d != %d\n", computedChecksum, record.Checksum)
+		log.Printf("getNextSparseIndexRecord:Error computing checksum: %d != %d for key: %s\n", computedChecksum, record.Checksum, string(record.Key))
 		return nil, lib.ErrBadChecksum
 	}
 	// Return the record.

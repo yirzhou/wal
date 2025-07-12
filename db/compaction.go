@@ -18,6 +18,14 @@ type CompactionPlan struct {
 	overlappingSegments []SegmentMetadata
 }
 
+// GetAllSegments returns all the segments in the compaction plan.
+func (c *CompactionPlan) GetAllSegments() []SegmentMetadata {
+	segments := make([]SegmentMetadata, 0)
+	segments = append(segments, c.baseSegments...)
+	segments = append(segments, c.overlappingSegments...)
+	return segments
+}
+
 // needsCompaction checks if the level needs compaction.
 // For L0, it checks if the number of segments is greater than or equal to the threshold.
 // For L1 and above, it checks if the total size of the segment files is greater than or equal to the threshold.
@@ -83,19 +91,34 @@ func (kv *KVStore) getCompactionPlan(level int) *CompactionPlan {
 	}
 }
 
+func GetTempSegmentFileName(segmentId uint64) string {
+	return fmt.Sprintf("%stmp-%06d", segmentFilePrefix, segmentId)
+}
+
+func GetTempSparseIndexFileName(segmentId uint64) string {
+	return fmt.Sprintf("%stmp-%06d", sparseIndexFilePrefix, segmentId)
+}
+
+func (s *KVStore) getTempSegmentFilePath(segmentId uint64) string {
+	return filepath.Join(s.getCheckpointDir(), GetTempSegmentFileName(segmentId))
+}
+
+func (s *KVStore) getTempSparseIndexFilePath(segmentId uint64) string {
+	return filepath.Join(s.getCheckpointDir(), GetTempSparseIndexFileName(segmentId))
+}
+
 // performMerge performs the compaction for the given compaction plan.
 // It returns the path to the new segment file.
 func (kv *KVStore) performMerge(compactionPlan *CompactionPlan) ([]SegmentMetadata, error) {
 	// Create a temporary segment file.
 	tempSegmentId := kv.AllocateNewSegmentID()
-	tempFileName := fmt.Sprintf("%s-tmp-%06d", segmentFilePrefix, tempSegmentId)
-	tempFile, err := os.OpenFile(filepath.Join(kv.getCheckpointDir(), tempFileName), AppendFlags, 0644)
+	tempFile, err := os.OpenFile(kv.getTempSegmentFilePath(tempSegmentId), AppendFlags, 0644)
 	if err != nil {
 		log.Println("performCompaction: Error opening temp file:", err)
 		return nil, err
 	}
 	defer tempFile.Close()
-	tempSparseIndexFile, err := os.OpenFile(filepath.Join(kv.getCheckpointDir(), fmt.Sprintf("%s-tmp-%06d", sparseIndexFilePrefix, tempSegmentId)), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	tempSparseIndexFile, err := os.OpenFile(kv.getTempSparseIndexFilePath(tempSegmentId), AppendFlags, 0644)
 	if err != nil {
 		log.Println("performCompaction: Error opening temp sparse index file:", err)
 		return nil, err
@@ -112,7 +135,7 @@ func (kv *KVStore) performMerge(compactionPlan *CompactionPlan) ([]SegmentMetada
 	sparseIndexRecords := make(sparseIndex, 0)
 	// Open all overlapping segments.
 	pathToFile := make(map[string]*os.File)
-	for _, segment := range compactionPlan.overlappingSegments {
+	for _, segment := range compactionPlan.GetAllSegments() {
 		segmentFile, err := os.OpenFile(segment.filePath, os.O_RDONLY, 0644)
 		if err != nil {
 			log.Println("performCompaction: Error opening segment file:", err)
@@ -147,13 +170,11 @@ func (kv *KVStore) performMerge(compactionPlan *CompactionPlan) ([]SegmentMetada
 		} else {
 			// Check if offset is over the threshold and split the file further.
 			isTombstone := bytes.Equal(minRecord.Record.Value, lib.TOMBSTONE)
-			if currentNewSegmentOffset+int64(minRecord.Record.Size()) > segmentFileSizeThresholdLX && !isTombstone {
-				// Persist the current temp file.
-				tempFile.Sync()
-
+			if currentNewSegmentOffset+int64(minRecord.Record.Size()) > kv.segmentFileSizeThresholdLX && !isTombstone {
 				// Split the file further.
+				finalFilePath := kv.getSegmentFilePath(tempSegmentId)
 				segmentMetadataList = append(segmentMetadataList, SegmentMetadata{
-					filePath:    tempFile.Name(),
+					filePath:    finalFilePath,
 					minKey:      minKey,
 					maxKey:      prevKey,
 					level:       compactionPlan.baseSegments[0].level + 1,
@@ -162,13 +183,12 @@ func (kv *KVStore) performMerge(compactionPlan *CompactionPlan) ([]SegmentMetada
 				})
 				// Create a new temp file.
 				tempSegmentId = kv.AllocateNewSegmentID()
-				tempFileName = fmt.Sprintf("%s-tmp-%06d", segmentFilePrefix, tempSegmentId)
-				tempFile, err = os.OpenFile(filepath.Join(kv.getCheckpointDir(), tempFileName), AppendFlags, 0644)
+				tempFile, err = os.OpenFile(kv.getTempSegmentFilePath(tempSegmentId), AppendFlags, 0644)
 				if err != nil {
 					log.Println("performCompaction: Error opening temp file:", err)
 					return nil, err
 				}
-				tempSparseIndexFile, err = os.OpenFile(filepath.Join(kv.getCheckpointDir(), fmt.Sprintf("%s-tmp-%06d", sparseIndexFilePrefix, tempSegmentId)), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				tempSparseIndexFile, err = os.OpenFile(kv.getTempSparseIndexFilePath(tempSegmentId), AppendFlags, 0644)
 				if err != nil {
 					log.Println("performCompaction: Error opening temp sparse index file:", err)
 					return nil, err
@@ -215,11 +235,9 @@ func (kv *KVStore) performMerge(compactionPlan *CompactionPlan) ([]SegmentMetada
 			})
 		}
 	}
-	// fsync the temp file.
-	tempFile.Sync()
 	// Add to the segment metadata list.
 	segmentMetadataList = append(segmentMetadataList, SegmentMetadata{
-		filePath:    tempFile.Name(),
+		filePath:    kv.getSegmentFilePath(tempSegmentId),
 		minKey:      minKey,
 		maxKey:      prevKey,
 		id:          tempSegmentId,
@@ -264,13 +282,43 @@ func (kv *KVStore) doCompaction() error {
 		log.Println("doCompaction: Error flushing manifest file:", err)
 		return err
 	}
-	os.Rename(tmpManifestFilePath, filepath.Join(kv.getCheckpointDir(), "MANIFEST"))
+
+	// Atomically rename the manifest file.
+	manifestSegmentID := kv.AllocateSegmentIDUnsafe()
+	manifestFilePath := kv.getManifestFilePath(manifestSegmentID)
+	err = os.Rename(tmpManifestFilePath, manifestFilePath)
+	if err != nil {
+		log.Println("doCompaction: Error renaming manifest file:", err)
+		return err
+	}
+
+	// Update the CURRENT file.
+	kv.updateCheckpointFile(manifestFilePath)
+
+	// Rename all the segment files and sparse index files.
+	for _, segmentMetadata := range segmentMetadataList {
+		segmentID := segmentMetadata.id
+		segmentFilePath := segmentMetadata.filePath
+		sparseIndexFilePath := kv.getSparseIndexFilePath(segmentID)
+		tempSegmentFilePath := kv.getTempSegmentFilePath(segmentID)
+		tempSparseIndexFilePath := kv.getTempSparseIndexFilePath(segmentID)
+		err := os.Rename(tempSegmentFilePath, segmentFilePath)
+		if err != nil {
+			log.Println("doCompaction: Error renaming segment file:", err)
+			return err
+		}
+		err = os.Rename(tempSparseIndexFilePath, sparseIndexFilePath)
+		if err != nil {
+			log.Println("doCompaction: Error renaming sparse index file:", err)
+			return err
+		}
+	}
 
 	// Update the levels in memory
 	kv.levels = newLevels
 
 	// Update sparse index in memory
-	kv.removeSparseIndexEntries(compactionPlan)
+	kv.removeSparseIndexEntries(compactionPlan.GetAllSegments())
 	kv.addSparseIndexEntriesBulk(segmentMetadataList)
 
 	// Delete the old segments and indexes.
@@ -283,24 +331,27 @@ func (kv *KVStore) doCompaction() error {
 	return nil
 }
 
+// addSparseIndexEntriesBulk adds the sparse index entries to the mem state.
 func (kv *KVStore) addSparseIndexEntriesBulk(segmentMetadataList []SegmentMetadata) {
 	for _, segmentMetadata := range segmentMetadataList {
 		kv.memState.AddSparseIndexEntriesBulk(segmentMetadata.id, segmentMetadata.sparseIndex)
 	}
 }
 
-func (kv *KVStore) removeSparseIndexEntries(compactionPlan *CompactionPlan) {
-	for _, segment := range compactionPlan.baseSegments {
-		kv.memState.RemoveSparseIndexEntry(segment.id)
-	}
-	for _, segment := range compactionPlan.overlappingSegments {
+// removeSparseIndexEntries removes the sparse index entries from the mem state.
+func (kv *KVStore) removeSparseIndexEntries(segmentMetadataList []SegmentMetadata) {
+	for _, segment := range segmentMetadataList {
 		kv.memState.RemoveSparseIndexEntry(segment.id)
 	}
 }
 
 // deleteOldSegmentsAndIndexes deletes the old segments and indexes.
 func (kv *KVStore) deleteOldSegmentsAndIndexes(compactionPlan *CompactionPlan) error {
-	for _, segmentMetadata := range compactionPlan.baseSegments {
+	segments := make([]SegmentMetadata, 0)
+	segments = append(segments, compactionPlan.baseSegments...)
+	segments = append(segments, compactionPlan.overlappingSegments...)
+
+	for _, segmentMetadata := range segments {
 		segmentID := segmentMetadata.id
 		err := os.Remove(segmentMetadata.filePath)
 		if err != nil {

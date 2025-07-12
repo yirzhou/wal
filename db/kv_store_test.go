@@ -77,7 +77,7 @@ func TestRecoveryNormal(t *testing.T) {
 
 	// Record the last sequence number and current segment ID.
 	lastSequenceNum := kv.GetLastSequenceNum()
-	segmentID := kv.GetCurrentSegmentID()
+	segmentID := kv.GetCurrentSegmentIDSafe()
 
 	// Close the KVStore.
 	kv.Close()
@@ -89,7 +89,7 @@ func TestRecoveryNormal(t *testing.T) {
 	defer kv.CloseAndCleanUp()
 	// Check if the last sequence number and current segment ID are the same.
 	assert.Equal(t, lastSequenceNum, kv.GetLastSequenceNum())
-	assert.Equal(t, segmentID, kv.GetCurrentSegmentID())
+	assert.Equal(t, segmentID, kv.GetCurrentSegmentIDSafe())
 
 	// Check if the key-value pairs are recovered.
 	for i := range 100 {
@@ -111,7 +111,7 @@ func TestRecoveryWithCorruptedWALFile(t *testing.T) {
 		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
 	}
 
-	segmentID := kv.GetCurrentSegmentID()
+	segmentID := kv.GetCurrentSegmentIDSafe()
 
 	// Close the DB
 	kv.Close()
@@ -154,7 +154,7 @@ func TestRecoveryWithCorruptedSparseIndexFile(t *testing.T) {
 		kv.Put([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("value-%d", i)))
 	}
 
-	segmentID := kv.GetLastSegmentID()
+	segmentID := kv.GetCurrentSegmentIDUnsafe() - 1
 
 	// Close the DB
 	kv.Close()
